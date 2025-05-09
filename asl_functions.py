@@ -42,18 +42,7 @@ class SuppressOutput:
         sys.stdout = sys.__stdout__
         sys.stderr = sys.__stderr__
 
-try:
-    import ctypes
-    libc = ctypes.CDLL(None)
-    # Attempt to get C's stdout/stderr file descriptor
-    c_stdout = ctypes.c_void_p.in_dll(libc, 'stdout')
-    c_stderr = ctypes.c_void_p.in_dll(libc, 'stderr')
-    devnull = open(os.devnull, 'w')
-    os.dup2(devnull.fileno(), c_stdout.value)
-    os.dup2(devnull.fileno(), c_stderr.value)
-except:
-    # If this approach fails, continue with other methods
-    pass
+
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # 0=all, 1=INFO, 2=WARNING, 3=ERROR
 logging.getLogger("mediapipe").setLevel(logging.ERROR)
@@ -61,14 +50,10 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logging
 os.environ['GLOG_minloglevel'] = '3'      # Suppress Google logging (used by MediaPipe)
 os.environ['MEDIAPIPE_DISABLE_GPU'] = '1'  # Optional: Disable GPU logging messages
 
-os.environ['AUTOGRAPH_VERBOSITY'] = '0'
-# ABSL specific flags
-os.environ['ABSL_LOGGING_LEVEL'] = '50'  # Higher than any level that should be output
-os.environ['PYTHONWARNINGS'] = 'ignore'
+
 
 logging.getLogger("mediapipe").setLevel(logging.ERROR)
-logging.getLogger("absl").setLevel(logging.ERROR)
-logging.getLogger("tensorflow").setLevel(logging.ERROR)\
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 import cv2
 import mediapipe as mp
@@ -87,6 +72,8 @@ import glob
 import hashlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm 
+import gc
+import psutil
 
 
 
@@ -441,10 +428,10 @@ def detect(image_path, hand_model_path, face_model_path, min_hand_detection_conf
 
 
 
-def adaptive_detect(image_path, hand_model_path, face_model_path, min_hand_detection_confidence=0.5, min_hand_presence_confidence=0.5, 
+def adaptive_detect(image_path, hand_model_path, face_model_path, dominand_hand, min_hand_detection_confidence=0.5, min_hand_presence_confidence=0.5, 
                    min_face_detection_confidence=0.5, min_face_presence_confidence=0.5, 
-                   num_hands=2, dominand_hand='Right', visualize=False, output_face_blendshapes=True,
-                   max_attempts=3, threshold_reduction_factor=0.7, min_threshold=0.2):
+                   num_hands=2, visualize=False, output_face_blendshapes=True,
+                   max_attempts=1, threshold_reduction_factor=0.7, min_threshold=0.2):
     """
     Adaptively detects hands and face by progressively lowering detection thresholds
     for undetected body parts.
@@ -632,402 +619,7 @@ def update_progress(frame_idx, total_frames, timestamp_formatted):
 
 
 
-def process_video(video_path, adaptive_detect_func=adaptive_detect, hand_model_path=hand_model_path, face_model_path=face_model_path,
-                 min_hand_detection_confidence=0.5, min_hand_presence_confidence=0.5,
-                 min_face_detection_confidence=0.5, min_face_presence_confidence=0.5,
-                 num_hands=2, output_face_blendshapes=True,
-                 max_attempts=3, threshold_reduction_factor=0.7, min_threshold=0.2, 
-                 frame_step=1, start_time_seconds=0, end_time_seconds=None,
-                 save_failure_screenshots=False):
-    """
-    Process a video frame-by-frame using the adaptive_detect function and save results.
-    
-    Args:
-        video_path (str): Path to the video file
-        adaptive_detect_func: The adaptive detection function to use
-        min_hand_detection_confidence (float): Initial confidence threshold for hand detection
-        min_hand_presence_confidence (float): Initial confidence threshold for hand presence
-        min_face_detection_confidence (float): Initial confidence threshold for face detection
-        min_face_presence_confidence (float): Initial confidence threshold for face presence
-        num_hands (int): Maximum number of hands to detect
-        dominand_hand (str): Dominant hand preference ('Left' or 'Right')
-        output_face_blendshapes (bool): Whether to detect face blendshapes
-        max_attempts (int): Maximum detection attempts for adaptive detection
-        threshold_reduction_factor (float): Factor to reduce thresholds by
-        min_threshold (float): Minimum threshold limit
-        frame_step (int): Process every Nth frame (1 = all frames)
-        start_time_seconds (float): Time in seconds to start processing from
-        end_time_seconds (float): Time in seconds to end processing (None = process until end)
-        save_failure_screenshots (bool): Save screenshots for all frames with any detection failures
-        
-    Returns:
-        str: Path to the directory containing saved frame results
-    """
-    # Extract video name for directory creation
-    video_path = Path(video_path)
-    video_dir = video_path.parent
-    video_name = video_path.stem  # Get filename without extension
-    
-    # Extract dominant hand information from filename
-    if video_name.endswith("_R"):
-        extracted_dominant_hand = "Right"
-    elif video_name.endswith("_L"):
-        extracted_dominant_hand = "Left"
-    else:
-        # Default if not specified in filename
-        extracted_dominant_hand = "Right"
-        print(f"Warning: Could not determine dominant hand from filename, using default: {extracted_dominant_hand}")
 
-    # Use the extracted dominant hand instead of the parameter
-    dominand_hand = extracted_dominant_hand
-    print(f"Detected dominant hand from filename: {dominand_hand}")
-
-    # Create output directory
-    output_dir = video_dir / f"{video_name}_landmarks"
-    output_dir.mkdir(exist_ok=True)
-    
-    # Create screenshots directory if screenshot option is enabled
-    screenshots_dir = None
-    if save_failure_screenshots:
-        screenshots_dir = output_dir / "failure_screenshots"
-        screenshots_dir.mkdir(exist_ok=True)
-    
-    # Create a log file to track processing
-    log_file = output_dir / "processing_log.txt"
-    
-    # Create a detailed statistics file
-    stats_file = output_dir / "detection_statistics.json"
-
-    # Initialize statistics tracking
-    stats = {
-        "video_info": {
-            "name": video_name,
-            "path": str(video_path),
-            "total_frames": 0,
-            "processed_frames": 0,
-            "fps": 0,
-            "duration_seconds": 0,
-            "start_time": start_time_seconds,
-            "end_time": end_time_seconds,
-            "dominant_hand": dominand_hand,
-            "processing_started": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "processing_completed": None
-        },
-        "detection_rates": {
-            "dominant_hand": {
-                "detected": 0,
-                "failed": 0,
-                "detection_rate": 0
-            },
-            "non_dominant_hand": {
-                "detected": 0,
-                "failed": 0,
-                "detection_rate": 0
-            },
-            "face": {
-                "detected": 0,
-                "failed": 0,
-                "detection_rate": 0
-            },
-            "overall": {
-                "all_detected": 0,
-                "partial_detections": 0,
-                "no_detections": 0,
-                "success_rate": 0
-            }
-        },
-        "failed_frames": {
-            "dominant_hand_failures": [],
-            "non_dominant_hand_failures": [],
-            "face_failures": [],
-            "all_failures": []
-        },
-        "processing_performance": {
-            "average_processing_time_ms": 0,
-            "total_processing_time_seconds": 0
-        }
-    }
-    
-    with open(log_file, "w") as log:
-        log.write(f"Processing video: {video_path}\n")
-        log.write(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        log.write(f"Parameters:\n")
-        log.write(f"  - frame_step: {frame_step}\n")
-        log.write(f"  - start_time: {start_time_seconds} seconds\n")
-        if end_time_seconds is not None:
-            log.write(f"  - end_time: {end_time_seconds} seconds\n")
-        log.write(f"  - dominand_hand: {dominand_hand}\n")
-        log.write(f"  - num_hands: {num_hands}\n")
-        log.write(f"  - detection confidence thresholds: {min_hand_detection_confidence}, {min_face_detection_confidence}\n")
-        log.write("\n--- Frame processing log ---\n")
-    
-    # Open the video file
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise ValueError(f"Could not open video file: {video_path}")
-    
-    # Get video properties
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    duration_seconds = total_frames / fps if fps > 0 else 0
-    
-    # Update stats with video info
-    stats["video_info"]["total_frames"] = total_frames
-    stats["video_info"]["fps"] = fps
-    stats["video_info"]["duration_seconds"] = duration_seconds
-    if end_time_seconds==None:
-        stats["video_info"]["end_time"] = duration_seconds
-    
-    # Convert time to frame indices
-    start_frame = int(max(0, start_time_seconds * fps))
-    
-    # Set end frame if specified
-    if end_time_seconds is not None:
-        end_frame = min(total_frames, int(end_time_seconds * fps))
-    else:
-        end_frame = total_frames
-    
-    print(f"Video: {video_name}")
-    print(f"Total frames: {total_frames}")
-    print(f"FPS: {fps}")
-    print(f"Duration: {duration_seconds:.2f} seconds")
-    print(f"Processing frames {start_frame} to {end_frame} (time {start_time_seconds:.2f}s to {end_time_seconds if end_time_seconds is not None else duration_seconds:.2f}s)")
-    print(f"Output directory: {output_dir}")
-    
-    # Process frames
-    frame_idx = 0
-    processed_count = 0
-    total_processing_time = 0
-    
-    # Skip to start_frame
-    if start_frame > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        frame_idx = start_frame
-    
-    with tempfile.TemporaryDirectory() as temp_dir:
-        while frame_idx < end_frame:
-            # Read the next frame
-            ret, frame = cap.read()
-            if not ret:
-                break  # End of video
-            
-            # Only process every frame_step frames
-            if (frame_idx - start_frame) % frame_step != 0:
-                frame_idx += 1
-                continue
-                
-            # Get timestamp in milliseconds
-            timestamp_ms = int(frame_idx * 1000 / fps)
-            timestamp_formatted = f"{timestamp_ms//60000:02d}m{(timestamp_ms//1000)%60:02d}s{timestamp_ms%1000:03d}ms"
-            
-            # Temporary frame path
-            temp_frame_path = Path(temp_dir) / f"temp_frame_{frame_idx}.jpg"
-            
-            # Save the current frame as an image
-            cv2.imwrite(str(temp_frame_path), frame)
-            
-            # Process the frame with adaptive_detect
-            update_progress(frame_idx, total_frames, timestamp_formatted)
-            
-            start_time = time.time()
-            try:
-                with SuppressOutput():
-                # Use adaptive_detect on the frame
-                    results = adaptive_detect_func(
-                        str(temp_frame_path), hand_model_path, face_model_path,
-                        min_hand_detection_confidence=min_hand_detection_confidence,
-                        min_hand_presence_confidence=min_hand_presence_confidence,
-                        min_face_detection_confidence=min_face_detection_confidence,
-                        min_face_presence_confidence=min_face_presence_confidence,
-                        num_hands=num_hands,
-                        dominand_hand=dominand_hand,
-                        visualize=False,
-                        output_face_blendshapes=output_face_blendshapes,
-                        max_attempts=max_attempts,
-                        threshold_reduction_factor=threshold_reduction_factor,
-                        min_threshold=min_threshold
-                    )
-                
-                # Calculate processing time
-                proc_time = time.time() - start_time
-                total_processing_time += proc_time
-                
-                # Unpack results
-                dom_landmarks, non_dom_landmarks, confidence_scores, interpolation_scores, detection_status, blendshape_scores, face_detected, nose_to_wrist_dist = results
-                
-                # Update detection statistics
-                dom_hand_detected = detection_status[0] == 1
-                non_dom_hand_detected = detection_status[1] == 1
-                face_was_detected = face_detected == 1
-                
-                if dom_hand_detected:
-                    stats["detection_rates"]["dominant_hand"]["detected"] += 1
-                else:
-                    stats["detection_rates"]["dominant_hand"]["failed"] += 1
-                    stats["failed_frames"]["dominant_hand_failures"].append({
-                        "frame": frame_idx,
-                        "timestamp_ms": timestamp_ms,
-                        "file": f"{video_name}_frame{frame_idx:06d}_{timestamp_formatted}.npz"
-                    })
-                
-                if non_dom_hand_detected:
-                    stats["detection_rates"]["non_dominant_hand"]["detected"] += 1
-                else:
-                    stats["detection_rates"]["non_dominant_hand"]["failed"] += 1
-                    stats["failed_frames"]["non_dominant_hand_failures"].append({
-                        "frame": frame_idx,
-                        "timestamp_ms": timestamp_ms,
-                        "file": f"{video_name}_frame{frame_idx:06d}_{timestamp_formatted}.npz"
-                    })
-                
-                if face_was_detected:
-                    stats["detection_rates"]["face"]["detected"] += 1
-                else:
-                    stats["detection_rates"]["face"]["failed"] += 1
-                    stats["failed_frames"]["face_failures"].append({
-                        "frame": frame_idx,
-                        "timestamp_ms": timestamp_ms,
-                        "file": f"{video_name}_frame{frame_idx:06d}_{timestamp_formatted}.npz"
-                    })
-                
-                # Track combined detection status
-                detection_count = dom_hand_detected + non_dom_hand_detected + face_was_detected
-                
-                if detection_count == 3:
-                    stats["detection_rates"]["overall"]["all_detected"] += 1
-                elif detection_count == 0:
-                    stats["detection_rates"]["overall"]["no_detections"] += 1
-                    stats["failed_frames"]["all_failures"].append({
-                        "frame": frame_idx,
-                        "timestamp_ms": timestamp_ms,
-                        "file": f"{video_name}_frame{frame_idx:06d}_{timestamp_formatted}.npz"
-                    })
-                else:
-                    stats["detection_rates"]["overall"]["partial_detections"] += 1
-                
-                # Save screenshot if any detection failed and screenshots are enabled
-                if save_failure_screenshots and (not dom_hand_detected or not non_dom_hand_detected or not face_was_detected):
-                    # Create a detailed failure type description for the filename
-                    failure_type = []
-                    if not dom_hand_detected:
-                        failure_type.append("DomHand")
-                    if not non_dom_hand_detected:
-                        failure_type.append("NonDomHand")
-                    if not face_was_detected:
-                        failure_type.append("Face")
-                    
-                    failure_str = "_".join(failure_type)
-                    screenshot_filename = f"{video_name}_frame{frame_idx:06d}_{timestamp_formatted}_missing_{failure_str}.jpg"
-                    screenshot_path = screenshots_dir / screenshot_filename
-                    
-                    # Copy the frame to the screenshots directory
-                    cv2.imwrite(str(screenshot_path), frame)
-                    print(f"Saved failure screenshot: {screenshot_filename}")
-                
-                # Create output filename with frame info
-                output_filename = f"{video_name}_frame{frame_idx:06d}_{timestamp_formatted}.npz"
-                output_path = output_dir / output_filename
-                
-                # Save all results in a single .npz file
-                np.savez(
-                    output_path,
-                    dom_landmarks=dom_landmarks,
-                    non_dom_landmarks=non_dom_landmarks,
-                    confidence_scores=confidence_scores,
-                    interpolation_scores=interpolation_scores,
-                    detection_status=detection_status,
-                    blendshape_scores=blendshape_scores,
-                    face_detected=face_detected,
-                    nose_to_wrist_dist=nose_to_wrist_dist,
-                    frame_idx=np.array([frame_idx]),
-                    timestamp_ms=np.array([timestamp_ms])
-                )
-                
-                # Update processing log
-                detection_summary = f"Dom: {detection_status[0]}, Non-dom: {detection_status[1]}, Face: {face_detected}"
-                log_entry = f"Frame {frame_idx}: {detection_summary} (proc time: {proc_time:.2f}s)\n"
-                
-                with open(log_file, "a") as log:
-                    log.write(log_entry)
-                
-                processed_count += 1
-                
-            except Exception as e:
-                print(f"Error processing frame {frame_idx}: {e}")
-                with open(log_file, "a") as log:
-                    log.write(f"Error on frame {frame_idx}: {str(e)}\n")
-            
-            # Clean up temporary frame file
-            if temp_frame_path.exists():
-                temp_frame_path.unlink()
-                
-            frame_idx += 1
-    
-    # Close the video file
-    cap.release()
-    
-    # Update final statistics
-    stats["video_info"]["processed_frames"] = processed_count
-    stats["video_info"]["processing_completed"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Calculate detection rates
-    if processed_count > 0:
-        stats["detection_rates"]["dominant_hand"]["detection_rate"] = (
-            stats["detection_rates"]["dominant_hand"]["detected"] / processed_count * 100
-        )
-        stats["detection_rates"]["non_dominant_hand"]["detection_rate"] = (
-            stats["detection_rates"]["non_dominant_hand"]["detected"] / processed_count * 100
-        )
-        stats["detection_rates"]["face"]["detection_rate"] = (
-            stats["detection_rates"]["face"]["detected"] / processed_count * 100
-        )
-        stats["detection_rates"]["overall"]["success_rate"] = (
-            stats["detection_rates"]["overall"]["all_detected"] / processed_count * 100
-        )
-    
-    # Calculate processing performance
-    if processed_count > 0:
-        stats["processing_performance"]["average_processing_time_ms"] = (
-            total_processing_time / processed_count * 1000
-        )
-    stats["processing_performance"]["total_processing_time_seconds"] = total_processing_time
-    
-    # Save statistics to JSON file
-    with open(stats_file, "w") as f:
-        json.dump(stats, f, indent=2)
-    
-    # Add summary statistics to log file
-    with open(log_file, "a") as log:
-        log.write(f"\n\n===== PROCESSING SUMMARY =====\n")
-        log.write(f"Completed at: {stats['video_info']['processing_completed']}\n")
-        log.write(f"Frames processed: {processed_count} from {start_frame} to {min(end_frame, frame_idx-1)}\n\n")
-        
-        log.write("DETECTION RATES:\n")
-        log.write(f"  Dominant hand ({dominand_hand}): {stats['detection_rates']['dominant_hand']['detection_rate']:.1f}%\n")
-        log.write(f"  Non-dominant hand: {stats['detection_rates']['non_dominant_hand']['detection_rate']:.1f}%\n")
-        log.write(f"  Face: {stats['detection_rates']['face']['detection_rate']:.1f}%\n")
-        log.write(f"  All parts detected: {stats['detection_rates']['overall']['success_rate']:.1f}%\n\n")
-        
-        log.write("DETECTION FAILURES:\n")
-        log.write(f"  Frames with dominant hand failures: {len(stats['failed_frames']['dominant_hand_failures'])}\n")
-        log.write(f"  Frames with non-dominant hand failures: {len(stats['failed_frames']['non_dominant_hand_failures'])}\n")
-        log.write(f"  Frames with face failures: {len(stats['failed_frames']['face_failures'])}\n")
-        log.write(f"  Frames with all parts missing: {len(stats['failed_frames']['all_failures'])}\n\n")
-        
-        log.write("PERFORMANCE:\n")
-        log.write(f"  Average processing time per frame: {stats['processing_performance']['average_processing_time_ms']:.2f} ms\n")
-        log.write(f"  Total processing time: {stats['processing_performance']['total_processing_time_seconds']:.2f} seconds\n")
-    
-    print(f"\n===== PROCESSING SUMMARY =====")
-    print(f"Processed {processed_count} frames")
-    print(f"Detection rates: Dom hand: {stats['detection_rates']['dominant_hand']['detection_rate']:.1f}%, " +
-          f"Non-dom hand: {stats['detection_rates']['non_dominant_hand']['detection_rate']:.1f}%, " +
-          f"Face: {stats['detection_rates']['face']['detection_rate']:.1f}%")
-    print(f"All parts detected in {stats['detection_rates']['overall']['success_rate']:.1f}% of frames")
-    print(f"Full statistics saved to: {stats_file}")
-    print(f"Results saved to: {output_dir}")
-    
-    return str(output_dir)
 
 
 
@@ -1171,18 +763,19 @@ def modify_npz_file(file_path, modifications):
         else:
             # Add new array
             arrays[name] = modification
-            print(f"Adding new array '{name}' to the file")
+
     
     # Save back to the file with same format
     np.savez(file_path, **arrays)
     
-    print(f"Successfully modified/added {len(modifications)} arrays in {file_path}")
 
 
 
-def interpolate_undetected_hand_landmarks(directory_path):  
+
+def interpolate_undetected_hand_landmarks_new(directory_path):  
     """
     Interpolate landmarks for frames where hand detection failed.
+    Optimized version for faster CPU processing.
     """
     print(f"Starting interpolation for directory: {directory_path}")
     
@@ -1193,213 +786,207 @@ def interpolate_undetected_hand_landmarks(directory_path):
     first_frame_number = round(data['video_info']['fps'] * data['video_info']['start_time'])
     final_frame_number = round(data['video_info']['fps'] * data['video_info']['end_time'])
     
-    print(f"Processing frames range: {first_frame_number} to {final_frame_number}")
+    
     
     # Maximum possible sum of weights for normalization (when all 10 frames are available)
     MAX_WEIGHT_SUM = 2.92722222
     
-    # Process non-dominant hand failures
-    print("Processing non-dominant hand failures...")
-    missing_non_dominant_frame_list = [frame['frame'] for frame in data['failed_frames']['non_dominant_hand_failures']]
+    # Create a cache for loaded frame data to avoid reloading the same frames
+    frame_data_cache = {}
     
-    non_dom_interpolated_count = 0
-    
-    for missing_frame in data['failed_frames']['non_dominant_hand_failures']:
-        frame_number = missing_frame['frame']
-        filepath = missing_frame['file']
+    # Helper function to process either dominant or non-dominant hand
+    def process_hand_frames(failures, missing_frames_list, is_dominant):
+        hand_index = 0 if is_dominant else 1
+        hand_type = "dominant" if is_dominant else "non-dominant"
+        landmarks_key = 'dom_landmarks' if is_dominant else 'non_dom_landmarks'
         
-        # Only interpolate frames not at the edges of the video
-        if (frame_number - 5) <= first_frame_number or (frame_number + 5) >= final_frame_number:
-            print(f"Skipping frame {frame_number} - too close to video boundary")
-            continue
         
-        # Find frames with valid detections for interpolation
-        interpolation_frames = find_interpolation_frames(frame_number, missing_non_dominant_frame_list)
+        interpolated_count = 0
         
-        if not interpolation_frames:
-            print(f"No valid frames found for interpolating frame {frame_number}")
-            continue
-        
-        # Calculate interpolated landmarks
-        interpolation_weights_sum = 0
-        interpolated_coordinates = np.zeros(shape=(20, 3))
-        interpolated_wrist_to_nose = np.zeros(2)
-        
-        for interp_frame in interpolation_frames:
-            weight = 1 / ((frame_number - interp_frame) ** 2)
-            interpolation_weights_sum += weight
+        for missing_frame in failures:
+            frame_number = missing_frame['frame']
+            filepath = missing_frame['file']
             
-            # Find and load the reference frame
-            interp_partial_filename = data['video_info']['name'] + f"_frame{interp_frame:06d}"
-            try:
-                interp_files = find_file_with_partial_name(
-                    interp_partial_filename, 
-                    search_dir=directory_path, 
-                    recursive=False
-                )
+            # Only interpolate frames not at the edges of the video
+            if ((frame_number - 5) <= first_frame_number or (frame_number + 5) >= final_frame_number):
+                continue
+            
+            # Find frames with valid detections for interpolation
+            interpolation_frames = find_interpolation_frames(frame_number, missing_frames_list)
+            
+            if not interpolation_frames:
+                continue
+            
+            # Calculate interpolated landmarks
+            interpolation_weights_sum = 0
+            interpolated_coordinates = np.zeros(shape=(20, 3))
+            interpolated_wrist_to_nose = np.zeros(2)
+            
+            for interp_frame in interpolation_frames:
+                weight = 1 / ((frame_number - interp_frame) ** 2)
+                interpolation_weights_sum += weight
                 
-                if not interp_files:
-                    print(f"Warning: Could not find file for frame {interp_frame}")
-                    continue
-                    
-                interp_filepath = interp_files[0]
+                # Find and load the reference frame - use cached version if available
+                cache_key = f"{interp_frame}"
+                if cache_key in frame_data_cache:
+                    frame_data = frame_data_cache[cache_key]
+                else:
+                    # Format the filename following the same pattern as the original code
+                    interp_partial_filename = data['video_info']['name'] + f"_frame{interp_frame:06d}"
+                    try:
+                        interp_files = find_file_with_partial_name(
+                            interp_partial_filename, 
+                            search_dir=directory_path, 
+                            recursive=False
+                        )
+                        
+                        if not interp_files:
+                            print(f"Warning: Could not find file for frame {interp_frame}")
+                            sys.exit(1)
+                            
+                        interp_filepath = interp_files[0]
+                        
+                        # Load and cache the frame data
+                        frame_data = load_frame_data(interp_filepath)
+                        frame_data_cache[cache_key] = frame_data
+                        
+                    except Exception as e:
+                        print(f"Error processing frame {interp_frame}: {e}")
+                        sys.exit(1)
                 
-                # Load the frame data - index 1 for non-dominant hand landmarks
-                frame_data = load_frame_data(interp_filepath)
-                non_dom_landmarks = frame_data[1]  # Correct index for non-dominant hand
-                nose_to_wrist_non_dom = frame_data[7][1, :]
-                
+                # Get landmarks and nose-to-wrist distance for this hand type
+                landmarks = frame_data[hand_index]
+                nose_to_wrist = frame_data[7][hand_index, :]
                 
                 # Add weighted contribution
-                interpolated_coordinates += weight * non_dom_landmarks
-                interpolated_wrist_to_nose += weight * nose_to_wrist_non_dom
+                interpolated_coordinates += weight * landmarks
+                interpolated_wrist_to_nose += weight * nose_to_wrist
+            
+            # Normalize by sum of weights
+            if interpolation_weights_sum > 0:
+                interpolated_coordinates /= interpolation_weights_sum
+                interpolated_wrist_to_nose /= interpolation_weights_sum
                 
-            except Exception as e:
-                print(f"Error processing frame {interp_frame}: {e}")
-                continue
+                # Calculate confidence based on weights and frame distribution
+                has_frames_on_both_sides = has_numbers_on_both_sides(frame_number, interpolation_frames)
+                
+                if has_frames_on_both_sides:
+                    interpolation_confidence = interpolation_weights_sum / MAX_WEIGHT_SUM
+                else:
+                    interpolation_confidence = (interpolation_weights_sum / MAX_WEIGHT_SUM) * 0.8
+                    
+
+                
+                # Update the file with interpolated data
+                def update_interp_scores(arr):
+                    new_arr = arr.copy()
+                    new_arr[hand_index] = interpolation_confidence
+                    return new_arr
+                
+                def update_nose_to_wrist_scores(matrix):
+                    new_matrix = matrix.copy()
+                    new_matrix[hand_index, :] = interpolated_wrist_to_nose
+                    return new_matrix
+                    
+                modifications = {
+                    landmarks_key: interpolated_coordinates,
+                    'interpolation_scores': update_interp_scores,
+                    'nose_to_wrist_dist': update_nose_to_wrist_scores
+                }
+                
+                modify_npz_file(
+                    file_path=os.path.join(directory_path, filepath),
+                    modifications=modifications
+                )
+                
+                interpolated_count += 1
+        return interpolated_count        
+
         
-        # Normalize by sum of weights (crucial step!)
-        if interpolation_weights_sum > 0:
-            interpolated_coordinates /= interpolation_weights_sum
-            interpolated_wrist_to_nose /= interpolation_weights_sum
-            
-            # Calculate confidence based on weights and frame distribution
-            has_frames_on_both_sides = has_numbers_on_both_sides(frame_number, interpolation_frames)
-            
-            if has_frames_on_both_sides:
-                interpolation_confidence = interpolation_weights_sum / MAX_WEIGHT_SUM
-            else:
-                interpolation_confidence = (interpolation_weights_sum / MAX_WEIGHT_SUM) * 0.8
-                
-            print(f"Frame {frame_number}: Interpolated with confidence {interpolation_confidence:.2f}")
-            
-            # Update the file with interpolated data
-            def update_interp_scores(arr):
-                new_arr = arr.copy()
-                new_arr[1] = interpolation_confidence  # Index 1 for non-dominant hand
-                return new_arr
-            
-            def update_nose_to_wrist_scores(matrix):
-                new_matrix = matrix.copy()
-                new_matrix[1, :] = interpolated_wrist_to_nose
-                return new_matrix
-                
-            modifications = {
-                'non_dom_landmarks': interpolated_coordinates,
-                'interpolation_scores': update_interp_scores,
-                'nose_to_wrist_dist': update_nose_to_wrist_scores
-            }
-            
-            modify_npz_file(
-                file_path=os.path.join(directory_path, filepath),
-                modifications=modifications
-            )
-            
-            non_dom_interpolated_count += 1
+    
+    # Process non-dominant hand failures
+    missing_non_dominant_frame_list = [frame['frame'] for frame in data['failed_frames']['non_dominant_hand_failures']]
+    non_dom_count = process_hand_frames(
+        data['failed_frames']['non_dominant_hand_failures'],
+        missing_non_dominant_frame_list,
+        is_dominant=False
+    )
     
     # Process dominant hand failures
-    print(f"Interpolated {non_dom_interpolated_count} non-dominant hand frames")
-    print("Processing dominant hand failures...")
-    
     missing_dominant_frame_list = [frame['frame'] for frame in data['failed_frames']['dominant_hand_failures']]
+    dom_count = process_hand_frames(
+        data['failed_frames']['dominant_hand_failures'],
+        missing_dominant_frame_list,
+        is_dominant=True
+    )
     
-    dom_interpolated_count = 0
+    total_interpolated = non_dom_count + dom_count
+    print(f"Total interpolated: {total_interpolated} frames")
     
-    for missing_frame in data['failed_frames']['dominant_hand_failures']:
-        frame_number = missing_frame['frame']
-        filepath = missing_frame['file']
-        
-        # Only interpolate frames not at the edges of the video
-        if (frame_number - 5) <= first_frame_number or (frame_number + 5) >= final_frame_number:
+    return total_interpolated
+    
+
+def interpolate_undetected_hand_landmarks_new_wrapper(directory_path):
+    gc.collect()
+    statistics_file = os.path.join(directory_path, 'detection_statistics.json')
+    if not os.path.exists(statistics_file):
+        print(f"Warning: Missing detection_statistics.json in {directory_path}")
+        return -1, directory_path  # Special return value indicating file not found
+    
+    try:
+        with open(statistics_file, 'r') as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        print(f"Error: Invalid JSON in {statistics_file}")
+        return -1, directory_path
+    except Exception as e:
+        print(f"Error reading {statistics_file}: {str(e)}")
+        return -1, directory_path
+    
+    first_frame_number = round(data['video_info']['fps'] * data['video_info']['start_time'])
+    final_frame_number = round(data['video_info']['fps'] * data['video_info']['end_time'])
+
+    missing_dominant_frame_list = [frame['frame'] for frame in data['failed_frames']['dominant_hand_failures']]
+    missing_dominant_frame_list_with_interpolation_frames = [frame for frame in missing_dominant_frame_list if find_interpolation_frames(frame, missing_dominant_frame_list)]
+    missing_dominant_frame_list_no_edges = [frame for frame in missing_dominant_frame_list_with_interpolation_frames if not ((frame - 5) <= first_frame_number or (frame + 5) >= final_frame_number)]
+    number_of_frames_to_interpolate_dom = len(missing_dominant_frame_list_no_edges)
+
+
+    missing_non_dominant_frame_list = [frame['frame'] for frame in data['failed_frames']['non_dominant_hand_failures']]
+    missing_non_dominant_frame_list_with_interpolation_frames = [frame for frame in missing_non_dominant_frame_list if find_interpolation_frames(frame, missing_non_dominant_frame_list)]
+    missing_non_dominant_frame_list_no_edges = [frame for frame in missing_non_dominant_frame_list_with_interpolation_frames if not ((frame - 5) <= first_frame_number or (frame + 5) >= final_frame_number)]
+    number_of_frames_to_interpolate_non_dom = len(missing_non_dominant_frame_list_no_edges)
+
+    total_number_of_frames_to_interpolate = number_of_frames_to_interpolate_dom + number_of_frames_to_interpolate_non_dom
+    
+    
+    total_actually_interpolated = interpolate_undetected_hand_landmarks_new(directory_path)
+    
+    if total_number_of_frames_to_interpolate != total_actually_interpolated:
+        print(f"The function missed some interpolations. Expected {total_number_of_frames_to_interpolate} but actually got {total_actually_interpolated} , exiting...")
+        sys.exit(1)
+    else:
+        gc.collect()
+        return total_actually_interpolated, None
+
+
+
+
+
+def is_data_frame_good(frame_data, expected_shapes_list):
+    if len(frame_data)!=10:
+        print(f"Expected 10 outputs but got {len(frame_data)}")
+        return False
+    for i in range(8):
+        if i==6:
             continue
-        
-        # Find frames with valid detections for interpolation
-        interpolation_frames = find_interpolation_frames(frame_number, missing_dominant_frame_list)
-        
-        if not interpolation_frames:
-            continue
-        
-        # Calculate interpolated landmarks
-        interpolation_weights_sum = 0
-        interpolated_coordinates = np.zeros(shape=(20, 3))
-        interpolated_wrist_to_nose = np.zeros(2)
-        
-        for interp_frame in interpolation_frames:
-            weight = 1 / ((frame_number - interp_frame) ** 2)
-            interpolation_weights_sum += weight
-            
-            # Find and load the reference frame
-            interp_partial_filename = data['video_info']['name'] + f"_frame{interp_frame:06d}"
-            try:
-                interp_files = find_file_with_partial_name(
-                    interp_partial_filename, 
-                    search_dir=directory_path, 
-                    recursive=False
-                )
-                
-                if not interp_files:
-                    continue
-                    
-                interp_filepath = interp_files[0]
-                
-                # Load the frame data - index 0 for dominant hand landmarks
-                frame_data = load_frame_data(interp_filepath)
-                dom_landmarks = frame_data[0]  # Correct index for dominant hand
-                nose_to_wrist_dom = frame_data[7][0, :]
-                
-                # Add weighted contribution
-                interpolated_coordinates += weight * dom_landmarks
-                interpolated_wrist_to_nose += weight * nose_to_wrist_non_dom
-                
-            except Exception as e:
-                print(f"Error processing frame {interp_frame}: {e}")
-                continue
-        
-        # Normalize by sum of weights
-        if interpolation_weights_sum > 0:
-            interpolated_coordinates /= interpolation_weights_sum
-            interpolated_wrist_to_nose /= interpolation_weights_sum
-            # Calculate confidence based on weights and frame distribution
-            has_frames_on_both_sides = has_numbers_on_both_sides(frame_number, interpolation_frames)
-            
-            if has_frames_on_both_sides:
-                interpolation_confidence = interpolation_weights_sum / MAX_WEIGHT_SUM
-            else:
-                interpolation_confidence = (interpolation_weights_sum / MAX_WEIGHT_SUM) * 0.8
-            
-            # Update the file with interpolated data
-            def update_interp_scores(arr):
-                new_arr = arr.copy()
-                new_arr[0] = interpolation_confidence  # Index 0 for dominant hand
-                return new_arr
-            
-            def update_nose_to_wrist_scores(matrix):
-                new_matrix = matrix.copy()
-                new_matrix[0, :] = interpolated_wrist_to_nose
-                return new_matrix
-                
-            modifications = {
-                'dom_landmarks': interpolated_coordinates,
-                'interpolation_scores': update_interp_scores,
-                'nose_to_wrist_dist': update_nose_to_wrist_scores
-            }
-            
-
-            modify_npz_file(
-                file_path=os.path.join(directory_path, filepath),
-                modifications=modifications
-            )
-            
-            dom_interpolated_count += 1
-    
-    print(f"Interpolated {dom_interpolated_count} dominant hand frames")
-    print(f"Total interpolated: {non_dom_interpolated_count + dom_interpolated_count} frames")
-    
-    return non_dom_interpolated_count + dom_interpolated_count
-
-
-
-
+        if frame_data[i].shape != expected_shapes_list[i]:
+            print(f"Dimensions problem in loaded frame, in intex {i}")
+            return False
+    if (not isinstance(frame_data[8], int)):
+        print(f"Frame idx is not an integer")
+        return False
+    return True
 
 def is_valid_detection(frame_data, is_dominant_hand):
     """
@@ -1437,42 +1024,46 @@ def has_value(frame_data, is_dominant_hand):
 
 def cartesian_to_spherical(velocities):
     """
-    Convert Cartesian velocities (ux, uy, uz) to spherical coordinate features.
+    Vectorized version: Convert Cartesian velocities to spherical coordinate features.
     
     Args:
-        velocities: NumPy array of shape (20, 3) with Cartesian velocities
+        ties: NumPy array of shape (20, 3) with Cartesian velocities
         
     Returns:
         NumPy array of shape (20, 5) with spherical features:
             [vmagnitude, ϕsin, ϕcos, θsin, θcos]
     """
-    num_landmarks = velocities.shape[0]
-    spherical_features = np.zeros((num_landmarks, 5))
+    # Extract Cartesian components
+    ux = velocities[:, 0]
+    uy = velocities[:, 1]
+    uz = velocities[:, 2]
     
-    for i in range(num_landmarks):
-        ux, uy, uz = velocities[i]
+    # Calculate velocity magnitude
+    vmagnitude = np.sqrt(ux**2 + uy**2 + uz**2)
+    
+    # Create result array with magnitude in first column
+    spherical_features = np.zeros((velocities.shape[0], 5))
+    spherical_features[:, 0] = vmagnitude
+    
+    # Create mask for non-zero velocities
+    nonzero_mask = vmagnitude > 0
+    
+    if np.any(nonzero_mask):
+        # Calculate azimuth angle (phi) for non-zero velocities
+        phi = np.zeros_like(vmagnitude)
+        phi[nonzero_mask] = np.arctan2(uy[nonzero_mask], ux[nonzero_mask])
         
-        # Calculate velocity magnitude
-        vmagnitude = np.sqrt(ux**2 + uy**2 + uz**2)
-        spherical_features[i, 0] = vmagnitude
+        # Store sin and cos of phi
+        spherical_features[:, 1] = np.sin(phi)
+        spherical_features[:, 2] = np.cos(phi)
         
-        # Handle edge cases to avoid division by zero
-        if vmagnitude == 0:
-            # If velocity is zero, set all angles to zero
-            spherical_features[i, 1:] = 0
-            continue
+        # Calculate elevation angle (theta) for non-zero velocities
+        cos_theta = np.zeros_like(vmagnitude)
+        cos_theta[nonzero_mask] = np.clip(uz[nonzero_mask] / vmagnitude[nonzero_mask], -1.0, 1.0)
         
-        # Calculate azimuth angle (ϕ)
-        phi = np.arctan2(uy, ux)
-        spherical_features[i, 1] = np.sin(phi)  # ϕsin
-        spherical_features[i, 2] = np.cos(phi)  # ϕcos
-        
-        # Calculate elevation angle (θ)
-        # Clamp uz/vmagnitude to range [-1, 1] to avoid numerical errors
-        cos_theta = np.clip(uz / vmagnitude, -1.0, 1.0)
         theta = np.arccos(cos_theta)
-        spherical_features[i, 3] = np.sin(theta)  # θsin
-        spherical_features[i, 4] = cos_theta      # θcos (already calculated)
+        spherical_features[:, 3] = np.sin(theta)
+        spherical_features[:, 4] = cos_theta
     
     return spherical_features
 
@@ -1520,6 +1111,59 @@ def cartesian_to_polar_features(velocities):
     
     return result
 
+
+def sorted_npz_files_checked(directory_path):
+    if os.path.exists(directory_path) and os.path.isdir(directory_path):
+        # List all NPZ files in the directory
+        npz_files = sorted(glob.glob(os.path.join(directory_path, "*.npz")))
+    else:
+        print(f"Directory path {directory_path} doesn't exist or it isn't a directory")
+        sys.exit(1)
+        
+    
+    # Skip if no files found
+    if not npz_files:
+        print(f"No NPZ files found in {directory_path}")
+        sys.exit(1)
+    
+    
+    with open(os.path.join(directory_path, 'detection_statistics.json')) as f:
+        statistics_file = json.load(f)
+    
+    if statistics_file['video_info']['total_frames'] != len(npz_files):
+        print("npz filepath list contain different amount of items than total frames")
+        sys.exit(1)
+
+    
+
+    expected_shapes_list = [(20, 3), (20, 3), (2,), (2,), (2,), (52,), 0, (2, 2)]
+    # Create a mapping of frame indices to file paths and check if all files are good
+    frame_to_file = {}
+    for file_path in npz_files:
+        try:
+            frame_data = load_frame_data(file_path)
+        except Exception as e:
+            print(f"Error loading frame with path: {file_path}: {e}")
+            sys.exit(1)
+            
+        if not is_data_frame_good(frame_data=frame_data, expected_shapes_list=expected_shapes_list):
+            print(f"Wrong loaded frame data dimensions for frame with path {file_path}, exiting...")
+            sys.exit(1)
+        frame_idx = frame_data[8]  # Index for frame_idx
+        frame_to_file[frame_idx] = file_path
+
+    
+    frame_indices = sorted(frame_to_file.keys())
+    if not all(frame_indices[i+1] - frame_indices[i] == 1 for i in range(len(frame_indices) - 1)):
+        print("Consecutive frames are not different by one frame")
+        sys.exit(1)
+
+    
+
+    min_frame = min(frame_indices)
+    max_frame = max(frame_indices)
+    return frame_to_file, frame_indices, min_frame, max_frame
+
 def compute_landmark_velocities(directory_path):
     """
     Compute velocity features for hand landmarks using central differencing with two window sizes,
@@ -1531,31 +1175,10 @@ def compute_landmark_velocities(directory_path):
     Returns:
         int: Number of frames processed
     """
-    # List all NPZ files in the directory
-    npz_files = sorted(glob.glob(os.path.join(directory_path, "*.npz")))
-    
-    # Skip if no files found
-    if not npz_files:
-        print(f"No NPZ files found in {directory_path}")
-        return 0
-    
-    print(f"Computing velocities for {len(npz_files)} files...")
-    
-    # Create a mapping of frame indices to file paths
-    frame_to_file = {}
-    for file_path in npz_files:
-        frame_data = load_frame_data(file_path)
-        frame_idx = frame_data[8]  # Index for frame_idx
-        frame_to_file[frame_idx] = file_path
-    
-    frame_indices = sorted(frame_to_file.keys())
+    frame_to_file, frame_indices, min_frame, max_frame = sorted_npz_files_checked(directory_path=directory_path)
     processed_count = 0
-    
-
-    min_frame = min(frame_indices)
-    max_frame = max(frame_indices)
     safe_margin = 5  # Skip processing frames within 5 frames of the edge
-    
+    frame_cache = {}
     # Process each frame
     for i, curr_idx in enumerate(frame_indices):
         if curr_idx < min_frame + safe_margin or curr_idx > max_frame - safe_margin:
@@ -1588,36 +1211,49 @@ def compute_landmark_velocities(directory_path):
             modify_npz_file(current_file_path, modifications)
             processed_count += 1
             
-            # Log that we're skipping calculation
-            print(f"Frame {curr_idx} too close to video boundary - setting zero velocities")
+
             continue
-        # Load current frame
-        current_file_path = frame_to_file[curr_idx]
-        curr_frame_data = load_frame_data(current_file_path)
         
-        # Store needed frames in a dictionary for easy access
-        frame_cache = {curr_idx: curr_frame_data}
-        
-        # Load all potentially needed frames in the -5 to +5 range
-        for offset in range(-5, 6):
-            if offset == 0:  # Skip current frame (already loaded)
-                continue
+        if curr_idx==safe_margin:
+            # Load current frame
+            current_file_path = frame_to_file[curr_idx]
+            try:
+                curr_frame_data = load_frame_data(current_file_path)
+            except Exception as e:
+                print(f"Error loading frame {curr_idx}: {e}")
+                sys.exit(1)
             
-            check_idx = curr_idx + offset
-            if check_idx in frame_to_file:
-                frame_cache[check_idx] = load_frame_data(frame_to_file[check_idx])
-            else:
-                frame_cache[check_idx] = None  # Mark as not available
         
-        # Extract dominant and non-dominant hand landmarks from current frame
-        dom_landmarks = curr_frame_data[0]
-        non_dom_landmarks = curr_frame_data[1]
+        
+            # Load all potentially needed frames in the -5 to +5 range
+            for offset in range(-5, 6):
+                check_idx = curr_idx + offset
+                if check_idx in frame_to_file:
+                    try:
+                        frame_cache[check_idx] = load_frame_data(frame_to_file[check_idx])
+                    except Exception as e:
+                        print(f"Error loading frame {check_idx}: {e}")
+                        sys.exit(1)
+                else:
+                    print(f"Frame: {check_idx} not available")
+                    sys.exit(1)  
+        else:
+            try:
+                frame_cache[curr_idx+5] = load_frame_data(frame_to_file[curr_idx+5])
+                del frame_cache[curr_idx-6]
+            except Exception as e:
+                print(f"Error loading frame {curr_idx+5}: {e}")
+                sys.exit(1)
+            current_file_path = frame_to_file[curr_idx]
+            curr_frame_data = frame_cache[curr_idx]
+        
+
         
         # Initialize velocity arrays in Cartesian coordinates
-        dom_velocity_small_cart = np.zeros_like(dom_landmarks)
-        dom_velocity_large_cart = np.zeros_like(dom_landmarks)
-        non_dom_velocity_small_cart = np.zeros_like(non_dom_landmarks)
-        non_dom_velocity_large_cart = np.zeros_like(non_dom_landmarks)
+        dom_velocity_small_cart = np.zeros((20, 3))
+        dom_velocity_large_cart = np.zeros((20, 3))
+        non_dom_velocity_small_cart = np.zeros((20, 3))
+        non_dom_velocity_large_cart = np.zeros((20, 3))
         
         wrist_velocity_small = np.zeros((2, 2))  # 2 hands × [x, y] coordinates
         wrist_velocity_large = np.zeros((2, 2))  # 2 hands × [x, y] coordinates
@@ -1638,412 +1274,249 @@ def compute_landmark_velocities(directory_path):
         non_dom_small_source_quality = 0.0
         non_dom_large_source_quality = 0.0
         
+        def satisfied_symmetric_windows_condition(positive_offset, negative_offset, is_dom_hand):
+            return (curr_idx + positive_offset in frame_cache and frame_cache[curr_idx + positive_offset] is not None and 
+            is_valid_detection(frame_cache[curr_idx + positive_offset], is_dom_hand) and 
+            curr_idx - negative_offset in frame_cache and frame_cache[curr_idx - negative_offset] is not None and 
+            has_value(frame_cache[curr_idx - negative_offset], is_dom_hand))
+        
+        def single_positive_check(positive_offset, is_dom_hand):
+            return (curr_idx + positive_offset in frame_cache and frame_cache[curr_idx + positive_offset] is not None and 
+            is_valid_detection(frame_cache[curr_idx + positive_offset], is_dom_hand))
+        
+        def negative_check(negative_offset, is_dom_hand):
+            return (curr_idx - negative_offset in frame_cache and frame_cache[curr_idx - negative_offset] is not None and 
+            has_value(frame_cache[curr_idx - negative_offset], is_dom_hand))
+            
+        def velocity_and_confidence_calculations(positive_offset, negative_offset, is_dom_hand):
+            if is_dom_hand:
+                index=0
+            else:
+                index=1
+            distance_of_offsets = positive_offset + negative_offset
+            velocity_cart = (frame_cache[curr_idx + positive_offset][index] - frame_cache[curr_idx - negative_offset][index]) / distance_of_offsets
+            wrist_velocity = (frame_cache[curr_idx + positive_offset][7][index, :] - frame_cache[curr_idx - negative_offset][7][index, :]) / distance_of_offsets
+            conf = min(frame_cache[curr_idx + positive_offset][2][index], frame_cache[curr_idx - negative_offset][2][index])  
+            # Calculate source quality factor (average of interpolation confidences)
+            t_plus_1_interp = frame_cache[curr_idx + positive_offset][3][index]
+            t_minus_1_interp = frame_cache[curr_idx - negative_offset][3][index]
+            source_quality = (t_plus_1_interp + t_minus_1_interp) / 2.0
+            return velocity_cart, wrist_velocity, conf, source_quality
+        
+        
+        
         # ===== DOMINANT HAND VELOCITY CALCULATION =====
         
         # Small window [-1, +1] velocity with fallbacks
-        if (curr_idx + 1 in frame_cache and frame_cache[curr_idx + 1] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 1], True) and 
-            curr_idx - 1 in frame_cache and frame_cache[curr_idx - 1] is not None and 
-            has_value(frame_cache[curr_idx - 1], True)):
+        true_positive_offset_dom_small =0
+        true_negative_offset_dom_small =0
+        if satisfied_symmetric_windows_condition(positive_offset=1, negative_offset=1, is_dom_hand=True):
             # Ideal case: (t+1, t-1)
-            dom_velocity_small_cart = (frame_cache[curr_idx + 1][0] - frame_cache[curr_idx - 1][0]) / 2.0
-            wrist_velocity_small[0, :] = (frame_cache[curr_idx + 1][7][0, :] - frame_cache[curr_idx - 1][7][0, :]) / 2.0
-            dom_small_conf = min(frame_cache[curr_idx + 1][2][0], frame_cache[curr_idx - 1][2][0])  # Detection confidence of t+1 frame
+            true_positive_offset_dom_small=1
+            true_negative_offset_dom_small=1
             dom_small_method_weight = 1.0  # Ideal frames
-            # Calculate source quality factor (average of interpolation confidences)
-            t_plus_1_interp = frame_cache[curr_idx + 1][3][0]
-            t_minus_1_interp = frame_cache[curr_idx - 1][3][0]
-            dom_small_source_quality = (t_plus_1_interp + t_minus_1_interp) / 2.0
             
-        elif (curr_idx + 2 in frame_cache and frame_cache[curr_idx + 2] is not None and 
-              is_valid_detection(frame_cache[curr_idx + 2], True) and 
-              curr_idx - 2 in frame_cache and frame_cache[curr_idx - 2] is not None and 
-              has_value(frame_cache[curr_idx - 2], True)):
+        elif satisfied_symmetric_windows_condition(positive_offset=2, negative_offset=2, is_dom_hand=True):
             # Fallback 1: (t+2, t-2)
-            dom_velocity_small_cart = (frame_cache[curr_idx + 2][0] - frame_cache[curr_idx - 2][0]) / 4.0
-            wrist_velocity_small[0, :] = (frame_cache[curr_idx + 2][7][0, :] - frame_cache[curr_idx - 2][7][0, :]) / 4.0
-            dom_small_conf = min(frame_cache[curr_idx + 2][2][0], frame_cache[curr_idx - 2][2][0])  # Detection confidence of t+2 frame
+            true_positive_offset_dom_small=2
+            true_negative_offset_dom_small=2
             dom_small_method_weight = 0.8  # Wider symmetric window
-            # Calculate source quality factor
-            t_plus_2_interp = frame_cache[curr_idx + 2][3][0]
-            t_minus_2_interp = frame_cache[curr_idx - 2][3][0]
-            dom_small_source_quality = (t_plus_2_interp + t_minus_2_interp) / 2.0
-            
-        elif (curr_idx + 2 in frame_cache and frame_cache[curr_idx + 2] is not None and 
-              is_valid_detection(frame_cache[curr_idx + 2], True)):
-            if (curr_idx - 1 in frame_cache and frame_cache[curr_idx - 1] is not None and 
-                has_value(frame_cache[curr_idx - 1], True)):
+        elif single_positive_check(positive_offset=2, is_dom_hand=True):
+            if negative_check(negative_offset=1, is_dom_hand=True):
                 # Fallback 2: (t+2, t-1)
-                dom_velocity_small_cart = (frame_cache[curr_idx + 2][0] - frame_cache[curr_idx - 1][0]) / 3.0
-                wrist_velocity_small[0, :] = (frame_cache[curr_idx + 2][7][0, :] - frame_cache[curr_idx - 1][7][0, :]) / 3.0
-                dom_small_conf = min(frame_cache[curr_idx + 2][2][0], frame_cache[curr_idx - 1][2][0])  # Detection confidence of t+2 frame
+                true_positive_offset_dom_small=2
+                true_negative_offset_dom_small=1
                 dom_small_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_2_interp = frame_cache[curr_idx + 2][3][0]
-                t_minus_1_interp = frame_cache[curr_idx - 1][3][0]
-                dom_small_source_quality = (t_plus_2_interp + t_minus_1_interp) / 2.0
                 
             elif is_valid_detection(curr_frame_data, True):
                 # Fallback 3: (t+2, t)
-                dom_velocity_small_cart = (frame_cache[curr_idx + 2][0] - curr_frame_data[0]) / 2.0
-                wrist_velocity_small[0, :] = (frame_cache[curr_idx + 2][7][0, :] - curr_frame_data[7][0, :]) / 2.0
-                dom_small_conf = min(frame_cache[curr_idx + 2][2][0], curr_frame_data[2][0])
+                true_positive_offset_dom_small=2
                 dom_small_method_weight = 0.4  # One-sided derivative
-                # Calculate source quality factor
-                t_plus_2_interp = frame_cache[curr_idx + 2][3][0]
-                t_interp = curr_frame_data[3][0]
-                dom_small_source_quality = (t_plus_2_interp + t_interp) / 2.0
+                
                 
         elif is_valid_detection(curr_frame_data, True):
-            if (curr_idx - 1 in frame_cache and frame_cache[curr_idx - 1] is not None and 
-                has_value(frame_cache[curr_idx - 1], True)):
+            if negative_check(negative_offset=1, is_dom_hand=True):
                 # Fallback 4: (t, t-1)
-                dom_velocity_small_cart = (curr_frame_data[0] - frame_cache[curr_idx - 1][0])
-                wrist_velocity_small[0, :] = (curr_frame_data[7][0, :] - frame_cache[curr_idx - 1][7][0, :]) 
-                dom_small_conf = min(curr_frame_data[2][0], frame_cache[curr_idx - 1][2][0])  # Detection confidence of current frame
+                true_negative_offset_dom_small=1
                 dom_small_method_weight = 0.4  # One-sided derivative
-                # Calculate source quality factor
-                t_interp = curr_frame_data[3][0]
-                t_minus_1_interp = frame_cache[curr_idx - 1][3][0]
-                dom_small_source_quality = (t_interp + t_minus_1_interp) / 2.0
                 
-            elif (curr_idx - 2 in frame_cache and frame_cache[curr_idx - 2] is not None and 
-                  has_value(frame_cache[curr_idx - 2], True)):
+            elif negative_check(negative_offset=2, is_dom_hand=True):
                 # Fallback 5: (t, t-2)
-                dom_velocity_small_cart = (curr_frame_data[0] - frame_cache[curr_idx - 2][0]) / 2.0
-                wrist_velocity_small[0, :] = (curr_frame_data[7][0, :] - frame_cache[curr_idx - 2][7][0, :]) / 2.0
-                dom_small_conf = min(curr_frame_data[2][0], frame_cache[curr_idx - 2][2][0])  # Detection confidence of current frame
+                true_negative_offset_dom_small=2
                 dom_small_method_weight = 0.4  # One-sided derivative
-                # Calculate source quality factor
-                t_interp = curr_frame_data[3][0]
-                t_minus_2_interp = frame_cache[curr_idx - 2][3][0]
-                dom_small_source_quality = (t_interp + t_minus_2_interp) / 2.0
+        if (true_positive_offset_dom_small!=0 or true_negative_offset_dom_small!=0):
+            dom_velocity_small_cart, wrist_velocity_small[0, :], dom_small_conf, dom_small_source_quality = velocity_and_confidence_calculations(true_positive_offset_dom_small, true_negative_offset_dom_small, is_dom_hand=True)
         
-        # Large window [-5, +5] velocity with fallbacks
-
-        if (curr_idx + 5 in frame_cache and frame_cache[curr_idx + 5] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 5], True) and 
-            curr_idx - 5 in frame_cache and frame_cache[curr_idx - 5] is not None and 
-            has_value(frame_cache[curr_idx - 5], True)):
+        # Large window [-5, +5] velocity with fallbacks            
+        true_positive_offset_dom_large =0
+        true_negative_offset_dom_large =0
+        if satisfied_symmetric_windows_condition(positive_offset=5, negative_offset=5, is_dom_hand=True):
             # Ideal case: (t+5, t-5)
-            dom_velocity_large_cart = (frame_cache[curr_idx + 5][0] - frame_cache[curr_idx - 5][0]) / 10.0
-            wrist_velocity_large[0, :] = (frame_cache[curr_idx + 5][7][0, :] - frame_cache[curr_idx - 5][7][0, :]) / 10.0
-            dom_large_conf = min(frame_cache[curr_idx + 5][2][0], frame_cache[curr_idx - 5][2][0])  # Detection confidence of t+5 frame
+            true_positive_offset_dom_large =5
+            true_negative_offset_dom_large =5
             dom_large_method_weight = 1.0  # Ideal frames
-            # Calculate source quality factor
-            t_plus_5_interp = frame_cache[curr_idx + 5][3][0]
-            t_minus_5_interp = frame_cache[curr_idx - 5][3][0]
-            dom_large_source_quality = (t_plus_5_interp + t_minus_5_interp) / 2.0
             
-        elif (curr_idx + 4 in frame_cache and frame_cache[curr_idx + 4] is not None and 
-        is_valid_detection(frame_cache[curr_idx + 4], True) and 
-        curr_idx - 4 in frame_cache and frame_cache[curr_idx - 4] is not None and 
-        has_value(frame_cache[curr_idx - 4], True)):
+        elif satisfied_symmetric_windows_condition(positive_offset=4, negative_offset=4, is_dom_hand=True):
         # Fallback 1: (t+4, t-4)
-            dom_velocity_large_cart = (frame_cache[curr_idx + 4][0] - frame_cache[curr_idx - 4][0]) / 8.0
-            wrist_velocity_large[0, :] = (frame_cache[curr_idx + 4][7][0, :] - frame_cache[curr_idx - 4][7][0, :]) / 8.0
-            dom_large_conf = min(frame_cache[curr_idx + 4][2][0], frame_cache[curr_idx - 4][2][0]) # Detection confidence of t+4 frame
+            true_positive_offset_dom_large = 4
+            true_negative_offset_dom_large = 4
             dom_large_method_weight = 0.8  # Wider symmetric window
-            # Calculate source quality factor
-            t_plus_4_interp = frame_cache[curr_idx + 4][3][0]
-            t_minus_4_interp = frame_cache[curr_idx - 4][3][0]
-            dom_large_source_quality = (t_plus_4_interp + t_minus_4_interp) / 2.0
-    
-        elif (curr_idx + 3 in frame_cache and frame_cache[curr_idx + 3] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 3], True) and 
-            curr_idx - 3 in frame_cache and frame_cache[curr_idx - 3] is not None and 
-            has_value(frame_cache[curr_idx - 3], True)):
+            
+        elif satisfied_symmetric_windows_condition(positive_offset=3, negative_offset=3, is_dom_hand=True):
             # Fallback 2: (t+3, t-3)
-            dom_velocity_large_cart = (frame_cache[curr_idx + 3][0] - frame_cache[curr_idx - 3][0]) / 6.0
-            wrist_velocity_large[0, :] = (frame_cache[curr_idx + 3][7][0, :] - frame_cache[curr_idx - 3][7][0, :]) / 6.0
-            dom_large_conf = min(frame_cache[curr_idx + 3][2][0], frame_cache[curr_idx - 3][2][0])  # Detection confidence of t+3 frame
+            true_positive_offset_dom_large = 3
+            true_negative_offset_dom_large = 3
             dom_large_method_weight = 0.8  # Wider symmetric window
-            # Calculate source quality factor
-            t_plus_3_interp = frame_cache[curr_idx + 3][3][0]
-            t_minus_3_interp = frame_cache[curr_idx - 3][3][0]
-            dom_large_source_quality = (t_plus_3_interp + t_minus_3_interp) / 2.0
             
         # Asymmetric fallbacks for large window
-        elif (curr_idx + 5 in frame_cache and frame_cache[curr_idx + 5] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 5], True)):
-            if (curr_idx - 4 in frame_cache and frame_cache[curr_idx - 4] is not None and 
-                has_value(frame_cache[curr_idx - 4], True)):
+        elif single_positive_check(positive_offset=5, is_dom_hand=True):
+            if negative_check(negative_offset=4, is_dom_hand=True):
                 # Fallback 3: (t+5, t-4)
-                dom_velocity_large_cart = (frame_cache[curr_idx + 5][0] - frame_cache[curr_idx - 4][0]) / 9.0
-                wrist_velocity_large[0, :] = (frame_cache[curr_idx + 5][7][0, :] - frame_cache[curr_idx - 4][7][0, :]) / 9.0
-                dom_large_conf = min(frame_cache[curr_idx + 5][2][0], frame_cache[curr_idx - 4][2][0])  # Detection confidence of t+5 frame
+                true_positive_offset_dom_large = 5
+                true_negative_offset_dom_large = 4
                 dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_5_interp = frame_cache[curr_idx + 5][3][0]
-                t_minus_4_interp = frame_cache[curr_idx - 4][3][0]
-                dom_large_source_quality = (t_plus_5_interp + t_minus_4_interp) / 2.0
                 
-            elif (curr_idx - 3 in frame_cache and frame_cache[curr_idx - 3] is not None and 
-                has_value(frame_cache[curr_idx - 3], True)):
+            elif negative_check(negative_offset=3, is_dom_hand=True):
                 # Fallback 4: (t+5, t-3)
-                dom_velocity_large_cart = (frame_cache[curr_idx + 5][0] - frame_cache[curr_idx - 3][0]) / 8.0
-                wrist_velocity_large[0, :] = (frame_cache[curr_idx + 5][7][0, :] - frame_cache[curr_idx - 3][7][0, :]) / 8.0
-                dom_large_conf = min(frame_cache[curr_idx + 5][2][0], frame_cache[curr_idx - 3][2][0])  # Detection confidence of t+5 frame
+                true_positive_offset_dom_large = 5
+                true_negative_offset_dom_large = 3
                 dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_5_interp = frame_cache[curr_idx + 5][3][0]
-                t_minus_3_interp = frame_cache[curr_idx - 3][3][0]
-                dom_large_source_quality = (t_plus_5_interp + t_minus_3_interp) / 2.0
         
-        elif (curr_idx + 4 in frame_cache and frame_cache[curr_idx + 4] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 4], True)):
-            if (curr_idx - 5 in frame_cache and frame_cache[curr_idx - 5] is not None and 
-                has_value(frame_cache[curr_idx - 5], True)):
+        elif single_positive_check(positive_offset=4, is_dom_hand=True):
+            if negative_check(negative_offset=5, is_dom_hand=True):
                 # Fallback 5: (t+4, t-5)
-                dom_velocity_large_cart = (frame_cache[curr_idx + 4][0] - frame_cache[curr_idx - 5][0]) / 9.0
-                wrist_velocity_large[0, :] = (frame_cache[curr_idx + 4][7][0, :] - frame_cache[curr_idx - 5][7][0, :]) / 9.0
-                dom_large_conf = min(frame_cache[curr_idx + 4][2][0], frame_cache[curr_idx - 5][2][0])  # Detection confidence of t+4 frame
+                true_positive_offset_dom_large = 4
+                true_negative_offset_dom_large = 5
                 dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_4_interp = frame_cache[curr_idx + 4][3][0]
-                t_minus_5_interp = frame_cache[curr_idx - 5][3][0]
-                dom_large_source_quality = (t_plus_4_interp + t_minus_5_interp) / 2.0
                 
-            elif (curr_idx - 3 in frame_cache and frame_cache[curr_idx - 3] is not None and 
-                has_value(frame_cache[curr_idx - 3], True)):
+            elif negative_check(negative_offset=3, is_dom_hand=True):
                 # Fallback 6: (t+4, t-3)
-                dom_velocity_large_cart = (frame_cache[curr_idx + 4][0] - frame_cache[curr_idx - 3][0]) / 7.0
-                wrist_velocity_large[0, :] = (frame_cache[curr_idx + 4][7][0, :] - frame_cache[curr_idx - 3][7][0, :]) / 7.0
-                dom_large_conf = min(frame_cache[curr_idx + 4][2][0], frame_cache[curr_idx - 3][2][0])  # Detection confidence of t+4 frame
+                true_positive_offset_dom_large = 4
+                true_negative_offset_dom_large = 3
                 dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_4_interp = frame_cache[curr_idx + 4][3][0]
-                t_minus_3_interp = frame_cache[curr_idx - 3][3][0]
-                dom_large_source_quality = (t_plus_4_interp + t_minus_3_interp) / 2.0
                 
-        elif (curr_idx + 3 in frame_cache and frame_cache[curr_idx + 3] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 3], True)):
-            if (curr_idx - 5 in frame_cache and frame_cache[curr_idx - 5] is not None and 
-                has_value(frame_cache[curr_idx - 5], True)):
+        elif single_positive_check(positive_offset=3, is_dom_hand=True):
+            if negative_check(negative_offset=5, is_dom_hand=True):
                 # Fallback 7: (t+3, t-5)
-                dom_velocity_large_cart = (frame_cache[curr_idx + 3][0] - frame_cache[curr_idx - 5][0]) / 8.0
-                wrist_velocity_large[0, :] = (frame_cache[curr_idx + 3][7][0, :] - frame_cache[curr_idx - 5][7][0, :]) / 8.0
-                dom_large_conf = min(frame_cache[curr_idx + 3][2][0], frame_cache[curr_idx - 5][2][0])  # Detection confidence of t+3 frame
+                true_positive_offset_dom_large = 3
+                true_negative_offset_dom_large = 5
                 dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_3_interp = frame_cache[curr_idx + 3][3][0]
-                t_minus_5_interp = frame_cache[curr_idx - 5][3][0]
-                dom_large_source_quality = (t_plus_3_interp + t_minus_5_interp) / 2.0
                 
-            elif (curr_idx - 4 in frame_cache and frame_cache[curr_idx - 4] is not None and 
-                has_value(frame_cache[curr_idx - 4], True)):
+            elif negative_check(negative_offset=4, is_dom_hand=True):
                 # Fallback 8: (t+3, t-4)
-                dom_velocity_large_cart = (frame_cache[curr_idx + 3][0] - frame_cache[curr_idx - 4][0]) / 7.0
-                wrist_velocity_large[0, :] = (frame_cache[curr_idx + 3][7][0, :] - frame_cache[curr_idx - 4][7][0, :]) / 7.0
-                dom_large_conf = min(frame_cache[curr_idx + 3][2][0], frame_cache[curr_idx - 4][2][0])  # Detection confidence of t+3 frame
+                true_positive_offset_dom_large = 3
+                true_negative_offset_dom_large = 4
                 dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_3_interp = frame_cache[curr_idx + 3][3][0]
-                t_minus_4_interp = frame_cache[curr_idx - 4][3][0]
-                dom_large_source_quality = (t_plus_3_interp + t_minus_4_interp) / 2.0
 
+        if (true_positive_offset_dom_large!=0 or true_negative_offset_dom_large!=0):
+            dom_velocity_large_cart, wrist_velocity_large[0, :], dom_large_conf, dom_large_source_quality = velocity_and_confidence_calculations(true_positive_offset_dom_large, true_negative_offset_dom_large, is_dom_hand=True)
+        
         # ===== NON-DOMINANT HAND VELOCITY CALCULATION =====
 
     # Small window [-1, +1] velocity with fallbacks for non-dominant hand
-        if (curr_idx + 1 in frame_cache and frame_cache[curr_idx + 1] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 1], False) and 
-            curr_idx - 1 in frame_cache and frame_cache[curr_idx - 1] is not None and 
-            has_value(frame_cache[curr_idx - 1], False)):
+        true_positive_offset_non_dom_small =0
+        true_negative_offset_non_dom_small =0
+        if satisfied_symmetric_windows_condition(positive_offset=1, negative_offset=1, is_dom_hand=False):
             # Ideal case: (t+1, t-1)
-            non_dom_velocity_small_cart = (frame_cache[curr_idx + 1][1] - frame_cache[curr_idx - 1][1]) / 2.0
-            wrist_velocity_small[1, :] = (frame_cache[curr_idx + 1][7][1, :] - frame_cache[curr_idx - 1][7][1, :]) / 2.0
-            non_dom_small_conf = min(frame_cache[curr_idx + 1][2][1], frame_cache[curr_idx - 1][2][1])  # Detection confidence of t+1 frame
+            true_positive_offset_non_dom_small =1
+            true_negative_offset_non_dom_small =1
             non_dom_small_method_weight = 1.0  # Ideal frames
-            # Calculate source quality factor
-            t_plus_1_interp = frame_cache[curr_idx + 1][3][1]
-            t_minus_1_interp = frame_cache[curr_idx - 1][3][1]
-            non_dom_small_source_quality = (t_plus_1_interp + t_minus_1_interp) / 2.0
             
-        elif (curr_idx + 2 in frame_cache and frame_cache[curr_idx + 2] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 2], False) and 
-            curr_idx - 2 in frame_cache and frame_cache[curr_idx - 2] is not None and 
-            has_value(frame_cache[curr_idx - 2], False)):
+        elif satisfied_symmetric_windows_condition(positive_offset=2, negative_offset=2, is_dom_hand=False):
             # Fallback 1: (t+2, t-2)
-            non_dom_velocity_small_cart = (frame_cache[curr_idx + 2][1] - frame_cache[curr_idx - 2][1]) / 4.0
-            wrist_velocity_small[1, :] = (frame_cache[curr_idx + 2][7][1, :] - frame_cache[curr_idx - 2][7][1, :]) / 4.0
-            non_dom_small_conf = min(frame_cache[curr_idx + 2][2][1], frame_cache[curr_idx - 2][2][1]) 
+            true_positive_offset_non_dom_small =2
+            true_negative_offset_non_dom_small =2
             non_dom_small_method_weight = 0.8  # Wider symmetric window
-            # Calculate source quality factor
-            t_plus_2_interp = frame_cache[curr_idx + 2][3][1]
-            t_minus_2_interp = frame_cache[curr_idx - 2][3][1]
-            non_dom_small_source_quality = (t_plus_2_interp + t_minus_2_interp) / 2.0
             
-        elif (curr_idx + 2 in frame_cache and frame_cache[curr_idx + 2] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 2], False)):
-            if (curr_idx - 1 in frame_cache and frame_cache[curr_idx - 1] is not None and 
-                has_value(frame_cache[curr_idx - 1], False)):
+        elif single_positive_check(positive_offset=2, is_dom_hand=False):
+            if negative_check(negative_offset=1, is_dom_hand=False):
                 # Fallback 2: (t+2, t-1)
-                non_dom_velocity_small_cart = (frame_cache[curr_idx + 2][1] - frame_cache[curr_idx - 1][1]) / 3.0
-                wrist_velocity_small[1, :] = (frame_cache[curr_idx + 2][7][1, :] - frame_cache[curr_idx - 2][7][1, :]) / 3.0
-                non_dom_small_conf = min(frame_cache[curr_idx + 2][2][1], frame_cache[curr_idx - 1][2][1])  
-                non_dom_small_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_2_interp = frame_cache[curr_idx + 2][3][1]
-                t_minus_1_interp = frame_cache[curr_idx - 1][3][1]
-                non_dom_small_source_quality = (t_plus_2_interp + t_minus_1_interp) / 2.0
+                true_positive_offset_non_dom_small =2
+                true_negative_offset_non_dom_small =1
+                non_dom_small_method_weight = 0.6  # Ideal frames
                 
             elif is_valid_detection(curr_frame_data, False):
                 # Fallback 3: (t+2, t)
-                non_dom_velocity_small_cart = (frame_cache[curr_idx + 2][1] - curr_frame_data[1]) / 2.0
-                wrist_velocity_small[1, :] = (frame_cache[curr_idx + 2][7][1, :] - curr_frame_data[7][1, :]) / 2.0
-                non_dom_small_conf = min(frame_cache[curr_idx + 2][2][1], curr_frame_data[2][1])
+                true_positive_offset_non_dom_small =2
                 non_dom_small_method_weight = 0.4  # One-sided derivative
-                # Calculate source quality factor
-                t_plus_2_interp = frame_cache[curr_idx + 2][3][1]
-                t_interp = curr_frame_data[3][1]
-                non_dom_small_source_quality = (t_plus_2_interp + t_interp) / 2.0
                 
         elif is_valid_detection(curr_frame_data, False):
-            if (curr_idx - 1 in frame_cache and frame_cache[curr_idx - 1] is not None and 
-                has_value(frame_cache[curr_idx - 1], False)):
+            if negative_check(negative_offset=1, is_dom_hand=False):
                 # Fallback 4: (t, t-1)
-                non_dom_velocity_small_cart = (curr_frame_data[1] - frame_cache[curr_idx - 1][1])
-                wrist_velocity_small[1, :] = (curr_frame_data[7][1, :] - frame_cache[curr_idx - 1][7][1, :]) 
-                non_dom_small_conf = min(curr_frame_data[2][1], frame_cache[curr_idx - 1][2][1])  # Detection confidence of current frame
+                true_negative_offset_non_dom_small =1
                 non_dom_small_method_weight = 0.4  # One-sided derivative
-                # Calculate source quality factor
-                t_interp = curr_frame_data[3][1]
-                t_minus_1_interp = frame_cache[curr_idx - 1][3][1]
-                non_dom_small_source_quality = (t_interp + t_minus_1_interp) / 2.0
                 
-            elif (curr_idx - 2 in frame_cache and frame_cache[curr_idx - 2] is not None and 
-                has_value(frame_cache[curr_idx - 2], False)):
+            elif negative_check(negative_offset=2, is_dom_hand=False):
                 # Fallback 5: (t, t-2)
-                non_dom_velocity_small_cart = (curr_frame_data[1] - frame_cache[curr_idx - 2][1]) / 2.0
-                wrist_velocity_small[1, :] = (curr_frame_data[7][1, :] - frame_cache[curr_idx -21][7][1, :]) / 2.0
-                non_dom_small_conf = min(curr_frame_data[2][1], frame_cache[curr_idx -2][2][1])  # Detection confidence of current frame
+                true_negative_offset_non_dom_small =2
                 non_dom_small_method_weight = 0.4  # One-sided derivative
-                # Calculate source quality factor
-                t_interp = curr_frame_data[3][1]
-                t_minus_2_interp = frame_cache[curr_idx - 2][3][1]
-                non_dom_small_source_quality = (t_interp + t_minus_2_interp) / 2.0
-    
+        
+        if (true_positive_offset_non_dom_small!=0 or true_negative_offset_non_dom_small!=0):
+            non_dom_velocity_small_cart, wrist_velocity_small[1, :], non_dom_small_conf, non_dom_small_source_quality = velocity_and_confidence_calculations(true_positive_offset_non_dom_small, true_negative_offset_non_dom_small, is_dom_hand=False)
+
+        true_positive_offset_non_dom_large =0
+        true_negative_offset_non_dom_large =0
         # Large window [-5, +5] velocity with fallbacks for non-dominant hand
-        if (curr_idx + 5 in frame_cache and frame_cache[curr_idx + 5] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 5], False) and 
-            curr_idx - 5 in frame_cache and frame_cache[curr_idx - 5] is not None and 
-            has_value(frame_cache[curr_idx - 5], False)):
+        if satisfied_symmetric_windows_condition(positive_offset=5, negative_offset=5, is_dom_hand=False):
             # Ideal case: (t+5, t-5)
-            non_dom_velocity_large_cart = (frame_cache[curr_idx + 5][1] - frame_cache[curr_idx - 5][1]) / 10.0
-            wrist_velocity_large[1, :] = (frame_cache[curr_idx + 5][7][1, :] - frame_cache[curr_idx - 5][7][1, :]) / 10.0
-            non_dom_large_conf = min(frame_cache[curr_idx + 5][2][1], frame_cache[curr_idx - 5][2][1])  
+            true_positive_offset_non_dom_large =5
+            true_negative_offset_non_dom_large =5
             non_dom_large_method_weight = 1.0  # Ideal frames
-            # Calculate source quality factor
-            t_plus_5_interp = frame_cache[curr_idx + 5][3][1]
-            t_minus_5_interp = frame_cache[curr_idx - 5][3][1]
-            non_dom_large_source_quality = (t_plus_5_interp + t_minus_5_interp) / 2.0
             
-        elif (curr_idx + 4 in frame_cache and frame_cache[curr_idx + 4] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 4], False) and 
-            curr_idx - 4 in frame_cache and frame_cache[curr_idx - 4] is not None and 
-            has_value(frame_cache[curr_idx - 4], False)):
+        elif satisfied_symmetric_windows_condition(positive_offset=4, negative_offset=4, is_dom_hand=False):
             # Fallback 1: (t+4, t-4)
-            non_dom_velocity_large_cart = (frame_cache[curr_idx + 4][1] - frame_cache[curr_idx - 4][1]) / 8.0
-            wrist_velocity_large[1, :] = (frame_cache[curr_idx + 4][7][1, :] - frame_cache[curr_idx - 4][7][1, :]) / 8.0
-            non_dom_large_conf = min(frame_cache[curr_idx + 4][2][1], frame_cache[curr_idx - 4][2][1])  
+            true_positive_offset_non_dom_large =4
+            true_negative_offset_non_dom_large =4
             non_dom_large_method_weight = 0.8  # Wider symmetric window
-            # Calculate source quality factor
-            t_plus_4_interp = frame_cache[curr_idx + 4][3][1]
-            t_minus_4_interp = frame_cache[curr_idx - 4][3][1]
-            non_dom_large_source_quality = (t_plus_4_interp + t_minus_4_interp) / 2.0
             
-        elif (curr_idx + 3 in frame_cache and frame_cache[curr_idx + 3] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 3], False) and 
-            curr_idx - 3 in frame_cache and frame_cache[curr_idx - 3] is not None and 
-            has_value(frame_cache[curr_idx - 3], False)):
+        elif satisfied_symmetric_windows_condition(positive_offset=3, negative_offset=3, is_dom_hand=False):
             # Fallback 2: (t+3, t-3)
-            non_dom_velocity_large_cart = (frame_cache[curr_idx + 3][1] - frame_cache[curr_idx - 3][1]) / 6.0
-            wrist_velocity_large[1, :] = (frame_cache[curr_idx + 3][7][1, :] - frame_cache[curr_idx - 3][7][1, :]) / 6.0
-            non_dom_large_conf = min(frame_cache[curr_idx + 3][2][1], frame_cache[curr_idx - 3][2][1])  # Detection confidence of t+3 frame
+            true_positive_offset_non_dom_large =3
+            true_negative_offset_non_dom_large =3
             non_dom_large_method_weight = 0.8  # Wider symmetric window
-            # Calculate source quality factor
-            t_plus_3_interp = frame_cache[curr_idx + 3][3][1]
-            t_minus_3_interp = frame_cache[curr_idx - 3][3][1]
-            non_dom_large_source_quality = (t_plus_3_interp + t_minus_3_interp) / 2.0
             
         # Asymmetric fallbacks for large window
-        elif (curr_idx + 5 in frame_cache and frame_cache[curr_idx + 5] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 5], False)):
-            if (curr_idx - 4 in frame_cache and frame_cache[curr_idx - 4] is not None and 
-                has_value(frame_cache[curr_idx - 4], False)):
+        elif single_positive_check(positive_offset=5, is_dom_hand=False):
+            if negative_check(negative_offset=4, is_dom_hand=False):
                 # Fallback 3: (t+5, t-4)
-                non_dom_velocity_large_cart = (frame_cache[curr_idx + 5][1] - frame_cache[curr_idx - 4][1]) / 9.0
-                wrist_velocity_large[1, :] = (frame_cache[curr_idx + 5][7][1, :] - frame_cache[curr_idx - 4][7][1, :]) / 9.0
-                non_dom_large_conf = min(frame_cache[curr_idx + 5][2][1], frame_cache[curr_idx - 4][2][1])  # Detection confidence of t+5 frame
+                true_positive_offset_non_dom_large =5
+                true_negative_offset_non_dom_large =4
                 non_dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_5_interp = frame_cache[curr_idx + 5][3][1]
-                t_minus_4_interp = frame_cache[curr_idx - 4][3][1]
-                non_dom_large_source_quality = (t_plus_5_interp + t_minus_4_interp) / 2.0
                 
-            elif (curr_idx - 3 in frame_cache and frame_cache[curr_idx - 3] is not None and 
-                has_value(frame_cache[curr_idx - 3], False)):
+            elif negative_check(negative_offset=3, is_dom_hand=False):
                 # Fallback 4: (t+5, t-3)
-                non_dom_velocity_large_cart = (frame_cache[curr_idx + 5][1] - frame_cache[curr_idx - 3][1]) / 8.0
-                wrist_velocity_large[1, :] = (frame_cache[curr_idx + 5][7][1, :] - frame_cache[curr_idx - 3][7][1, :]) / 8.0
-                non_dom_large_conf = min(frame_cache[curr_idx + 5][2][1], frame_cache[curr_idx - 3][2][1])  # Detection confidence of t+5 frame
+                true_positive_offset_non_dom_large =5
+                true_negative_offset_non_dom_large =3
                 non_dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_5_interp = frame_cache[curr_idx + 5][3][1]
-                t_minus_3_interp = frame_cache[curr_idx - 3][3][1]
-                non_dom_large_source_quality = (t_plus_5_interp + t_minus_3_interp) / 2.0
                 
-        elif (curr_idx + 4 in frame_cache and frame_cache[curr_idx + 4] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 4], False)):
-            if (curr_idx - 5 in frame_cache and frame_cache[curr_idx - 5] is not None and 
-                has_value(frame_cache[curr_idx - 5], False)):
+        elif single_positive_check(positive_offset=4, is_dom_hand=False):
+            if negative_check(negative_offset=5, is_dom_hand=False):
                 # Fallback 5: (t+4, t-5)
-                non_dom_velocity_large_cart = (frame_cache[curr_idx + 4][1] - frame_cache[curr_idx - 5][1]) / 9.0
-                wrist_velocity_large[1, :] = (frame_cache[curr_idx + 4][7][1, :] - frame_cache[curr_idx - 5][7][1, :]) / 9.0
-                non_dom_large_conf = min(frame_cache[curr_idx + 4][2][1], frame_cache[curr_idx - 5][2][1])  # Detection confidence of t+4 frame
+                true_positive_offset_non_dom_large =4
+                true_negative_offset_non_dom_large =5
                 non_dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_4_interp = frame_cache[curr_idx + 4][3][1]
-                t_minus_5_interp = frame_cache[curr_idx - 5][3][1]
-                non_dom_large_source_quality = (t_plus_4_interp + t_minus_5_interp) / 2.0
                 
-            elif (curr_idx - 3 in frame_cache and frame_cache[curr_idx - 3] is not None and 
-                has_value(frame_cache[curr_idx - 3], False)):
+            elif negative_check(negative_offset=3, is_dom_hand=False):
                 # Fallback 6: (t+4, t-3)
-                non_dom_velocity_large_cart = (frame_cache[curr_idx + 4][1] - frame_cache[curr_idx - 3][1]) / 7.0
-                wrist_velocity_large[1, :] = (frame_cache[curr_idx + 4][7][1, :] - frame_cache[curr_idx - 3][7][1, :]) / 7.0
-                non_dom_large_conf = min(frame_cache[curr_idx + 4][2][1], frame_cache[curr_idx - 3][2][1])  # Detection confidence of t+4 frame
+                true_positive_offset_non_dom_large =4
+                true_negative_offset_non_dom_large =3
                 non_dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_4_interp = frame_cache[curr_idx + 4][3][1]
-                t_minus_3_interp = frame_cache[curr_idx - 3][3][1]
-                non_dom_large_source_quality = (t_plus_4_interp + t_minus_3_interp) / 2.0
                 
-        elif (curr_idx + 3 in frame_cache and frame_cache[curr_idx + 3] is not None and 
-            is_valid_detection(frame_cache[curr_idx + 3], False)):
-            if (curr_idx - 5 in frame_cache and frame_cache[curr_idx - 5] is not None and 
-                has_value(frame_cache[curr_idx - 5], False)):
+        elif single_positive_check(positive_offset=3, is_dom_hand=False):
+            if negative_check(negative_offset=5, is_dom_hand=False):
                 # Fallback 7: (t+3, t-5)
-                non_dom_velocity_large_cart = (frame_cache[curr_idx + 3][1] - frame_cache[curr_idx - 5][1]) / 8.0
-                wrist_velocity_large[1, :] = (frame_cache[curr_idx + 3][7][1, :] - frame_cache[curr_idx - 5][7][1, :]) / 8.0
-                non_dom_large_conf = min(frame_cache[curr_idx + 3][2][1], frame_cache[curr_idx - 5][2][1])  # Detection confidence of t+3 frame
+                true_positive_offset_non_dom_large =3
+                true_negative_offset_non_dom_large =5
                 non_dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-                # Calculate source quality factor
-                t_plus_3_interp = frame_cache[curr_idx + 3][3][1]
-                t_minus_5_interp = frame_cache[curr_idx - 5][3][1]
-                non_dom_large_source_quality = (t_plus_3_interp + t_minus_5_interp) / 2.0
             
-        elif (curr_idx - 4 in frame_cache and frame_cache[curr_idx - 4] is not None and 
-            has_value(frame_cache[curr_idx - 4], False)):
-            # Fallback 8: (t+3, t-4)
-            non_dom_velocity_large_cart = (frame_cache[curr_idx + 3][1] - frame_cache[curr_idx - 4][1]) / 7.0
-            wrist_velocity_large[1, :] = (frame_cache[curr_idx + 3][7][1, :] - frame_cache[curr_idx - 4][7][1, :]) / 7.0
-            non_dom_large_conf = min(frame_cache[curr_idx + 3][2][1], frame_cache[curr_idx - 4][2][1])  # Detection confidence of t+3 frame
-            non_dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
-            # Calculate source quality factor
-            t_plus_3_interp = frame_cache[curr_idx + 3][3][1]
-            t_minus_4_interp = frame_cache[curr_idx - 4][3][1]
-            non_dom_large_source_quality = (t_plus_3_interp + t_minus_4_interp) / 2.0
+            elif negative_check(negative_offset=4, is_dom_hand=False):
+                # Fallback 8: (t+3, t-4)
+                true_positive_offset_non_dom_large =3
+                true_negative_offset_non_dom_large =4
+                non_dom_large_method_weight = 0.6  # Asymmetric window maintaining center point
+
+        if (true_positive_offset_non_dom_large!=0 or true_negative_offset_non_dom_large!=0):
+            non_dom_velocity_large_cart, wrist_velocity_large[1, :], non_dom_large_conf, non_dom_large_source_quality = velocity_and_confidence_calculations(true_positive_offset_non_dom_large, true_negative_offset_non_dom_large, is_dom_hand=False)
             
 
         
@@ -2090,13 +1563,231 @@ def compute_landmark_velocities(directory_path):
         modify_npz_file(current_file_path, modifications)
         processed_count += 1
         
-        # Progress update
-        if (i + 1) % 100 == 0 or i == len(frame_indices) - 1:
-            print(f"Processed {i+1}/{len(frame_indices)} frames")
+
     
     print(f"Velocity computation complete. Processed {processed_count} frames.")
     return processed_count
 
+
+def compute_landmark_velocities_wrapper(directory_path):
+    print(f"Computing velocities for directory path: {directory_path}")
+    gc.collect()
+    with open(os.path.join(directory_path, 'detection_statistics.json')) as f:
+        data = json.load(f)
+    expected_number_of_frames_to_compute = data['video_info']['processed_frames']
+    number_of_frames_actually_computed = compute_landmark_velocities(directory_path=directory_path)
+    if expected_number_of_frames_to_compute != number_of_frames_actually_computed:
+        print(f"Expected number of frames to compute: {expected_number_of_frames_to_compute} is not equal to the actually computed {number_of_frames_actually_computed} for directory_path: {directory_path}")
+        sys.exit(1)
+    gc.collect()
+    return number_of_frames_actually_computed
+
+
+
+def process_landmark_velocities_parallel(dataframe, velocity_func, batch_size=4, 
+                               report_dir=None, start_from_row=0):
+    """
+    Process multiple directories for velocity calculation from a dataframe with checkpointing and logging.
+    
+    Args:
+        dataframe (pd.DataFrame): DataFrame with a 'landmarks_file_path' column
+        velocity_func (function): Function that calculates velocities for a directory and returns processed frames count
+        batch_size (int): Size of directory batches to process
+        report_dir (str): Directory to save checkpoint and report files
+                         If None, no checkpointing or reporting is done
+        start_from_row (int): Row index to start processing from (for resuming)
+        
+    Returns:
+        pd.DataFrame: The input dataframe with an additional 'processed_frames' column
+    """
+    # Setup logging and checkpointing
+    checkpoint_file = None
+    report_data = {
+        "start_time": datetime.now().isoformat(),
+        "end_time": None,
+        "duration_seconds": 0,
+        "total_directories": 0,
+        "processed_directories": 0,
+        "successful_processing": 0,
+        "failed_processing": 0,
+        "last_processed_row": start_from_row - 1,
+        "status": "in_progress"
+    }
+    
+    if report_dir:
+        os.makedirs(report_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_file = os.path.join(report_dir, f"velocity_processing_{timestamp}.json")
+        
+        # Check if we're resuming from a crash
+        if start_from_row > 0:
+            print(f"Resuming from row {start_from_row}")
+            report_data["notes"] = f"Resumed from row {start_from_row}"
+        
+        # Initial write
+        with open(checkpoint_file, 'w') as f:
+            json.dump(report_data, f, indent=2)
+    
+    # Add directory column and reset index to ensure row tracking works correctly
+    dataframe = dataframe.reset_index(drop=True)
+
+    
+    # If resuming, apply a filter based on start_from_row
+    if start_from_row > 0:
+        working_df = dataframe.iloc[start_from_row:].copy()
+    else:
+        working_df = dataframe.copy()
+    
+    # More efficient way to get unique directories
+    unique_directories = working_df['landmarks_file_path'].tolist()
+    total_dirs = len(unique_directories)
+    
+    report_data["total_directories"] = total_dirs
+    print(f"Found {total_dirs} unique directories to process")
+    
+    # Limit concurrent directories based on system resources
+    max_concurrent_dirs = batch_size
+    print(f"Using {max_concurrent_dirs} concurrent processes")
+    
+    # Store results and track progress
+    overall_start_time = time.time()
+    processed_dirs = 0
+    successful_processing = 0
+    failed_processing = 0
+    last_processed_row = start_from_row - 1
+    
+    # Update checkpoint function
+    def update_checkpoint():
+        if checkpoint_file:
+            current_time = datetime.now()
+            elapsed = time.time() - overall_start_time
+            
+            report_data["processed_directories"] = processed_dirs
+            report_data["successful_processing"] = successful_processing
+            report_data["failed_processing"] = failed_processing
+            report_data["last_processed_row"] = last_processed_row
+            report_data["duration_seconds"] = elapsed
+            report_data["last_updated"] = current_time.isoformat()
+            
+            # Write to a temp file first then rename to avoid corruption if crashed during write
+            temp_file = checkpoint_file + ".tmp"
+            with open(temp_file, 'w') as f:
+                json.dump(report_data, f, indent=2)
+            
+            # Atomic rename operation
+            if os.path.exists(temp_file):
+                os.replace(temp_file, checkpoint_file)
+    
+    total_processed_frames = 0
+    # Process directories in batches
+    try:
+        for batch_idx in range(0, len(unique_directories), batch_size):
+            batch_directories = unique_directories[batch_idx:batch_idx + batch_size]
+            print(f"\nProcessing batch {batch_idx//batch_size + 1}/{(len(unique_directories) + batch_size - 1)//batch_size} "
+                  f"({len(batch_directories)} directories)")
+            
+            mem_available = psutil.virtual_memory().available / (1024**3)  # GB
+            if mem_available < 2:  # Less than 2GB available
+                print(f"Warning: Only {mem_available:.1f}GB memory available. Waiting 1 second...")
+                time.sleep(1)  # Wait for other processes to finish
+                gc.collect()
+            
+            # Process this batch of directories in parallel
+            with ProcessPoolExecutor(max_workers=max_concurrent_dirs) as executor:
+                # Submit all directories in this batch
+                future_to_dir = {
+                    executor.submit(velocity_func, dir_path): dir_path 
+                    for dir_path in batch_directories
+                }
+                
+                # Process results as they complete
+                for future in as_completed(future_to_dir):
+                    dir_path = future_to_dir[future]
+                    try:
+                        # Get velocity calculation results (frames processed count)
+                        processed_frames = future.result()
+                        dir_indices = dataframe[dataframe['landmarks_file_path'] == dir_path].index
+                        dataframe.loc[dir_indices, 'processed_frames'] = processed_frames
+                        processed_dirs += 1
+                        total_processed_frames += processed_frames
+                        
+                        # Track successful processing
+                        if processed_frames > 0:
+                            successful_processing += 1
+                        
+                        # Find the maximum row index for this landmarks_file_path
+                        dir_rows = working_df[working_df['landmarks_file_path'] == dir_path].index
+                        if len(dir_rows) > 0:
+                            last_processed_row = max(last_processed_row, max(dir_rows) + start_from_row)
+                    
+                    except Exception as e:
+                        print(f"Error processing directory {dir_path}: {str(e)}")
+                        sys.exit(1)
+            
+            # Update checkpoint after each batch
+            update_checkpoint()
+    
+    except Exception as e:
+        print(f"Error during processing: {str(e)}")
+        if checkpoint_file:
+            report_data["status"] = "crashed"
+            report_data["error"] = str(e)
+            update_checkpoint()
+        sys.exit(1)
+    
+    # Calculate final statistics
+    total_elapsed = time.time() - overall_start_time
+    
+    print(f"\nProcessing completed in {total_elapsed/60:.1f} minutes")
+    print(f"Total directories processed: {processed_dirs}/{total_dirs}")
+    print(f"Total frames processed: {total_processed_frames}")
+    print(f"Successful directories: {successful_processing}")
+    print(f"Failed directories: {failed_processing}")
+    
+    # Final checkpoint update
+    if checkpoint_file:
+        report_data["status"] = "completed"
+        report_data["end_time"] = datetime.now().isoformat()
+        report_data["duration_seconds"] = total_elapsed
+        report_data["processed_directories"] = processed_dirs
+        report_data["successful_processing"] = successful_processing
+        report_data["failed_processing"] = failed_processing
+        report_data["total_processed_frames"] = total_processed_frames
+        update_checkpoint()
+    
+    return dataframe
+
+
+def find_latest_velocity_checkpoint(report_dir):
+    """
+    Find the latest velocity checkpoint file in the report directory.
+    
+    Args:
+        report_dir (str): Directory containing checkpoint files
+        
+    Returns:
+        tuple: (last_processed_row, checkpoint_data) or (None, None) if not found
+    """
+    if not os.path.exists(report_dir):
+        return None, None
+    
+    checkpoint_files = [f for f in os.listdir(report_dir) 
+                        if f.startswith("velocity_processing_") and f.endswith(".json")]
+    
+    if not checkpoint_files:
+        return None, None
+    
+    # Sort by modification time (most recent first)
+    latest_file = max(checkpoint_files, key=lambda f: os.path.getmtime(os.path.join(report_dir, f)))
+    latest_path = os.path.join(report_dir, latest_file)
+    
+    try:
+        with open(latest_path, 'r') as f:
+            checkpoint_data = json.load(f)
+        return checkpoint_data["last_processed_row"], checkpoint_data
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        return None, None
 
 def load_frame_data_with_velocities(npz_path):
     """
@@ -2203,14 +1894,13 @@ def make_videos_df(directory_path):
 
 
 
-def process_video_new_2(video_path, adaptive_detect_func=adaptive_detect, hand_model_path=hand_model_path, face_model_path=face_model_path,
+def process_video_new_2(video_path, num_workers, adaptive_detect_func=adaptive_detect, hand_model_path=hand_model_path, face_model_path=face_model_path,
                  min_hand_detection_confidence=0.5, min_hand_presence_confidence=0.5,
                  min_face_detection_confidence=0.5, min_face_presence_confidence=0.5,
                  num_hands=2, output_face_blendshapes=True,
-                 max_attempts=3, threshold_reduction_factor=0.7, min_threshold=0.2, 
+                 max_attempts=1, threshold_reduction_factor=0.7, min_threshold=0.2, 
                  frame_step=1, start_time_seconds=0, end_time_seconds=None,
                  save_failure_screenshots=False,
-                 num_workers=None,  # Added parameter for parallel processing
                  batch_mode=False):  # Added parameter to indicate batch processing
     """
     Process a video frame-by-frame using the adaptive_detect function and save results.
@@ -2258,14 +1948,11 @@ def process_video_new_2(video_path, adaptive_detect_func=adaptive_detect, hand_m
     else:
         # Default if not specified in filename
         extracted_dominant_hand = "Right"
-        print(f"Warning: Could not determine dominant hand from filename, using default: {extracted_dominant_hand}")
+
 
     # Use the extracted dominant hand instead of the parameter
     dominand_hand = extracted_dominant_hand
-    if not batch_mode:
-        print(f"Detected dominant hand from filename: {dominand_hand}")
-    else:
-        print(f"[{os.path.basename(str(video_path))}] Dominant hand: {dominand_hand}")
+
 
     # Create output directory
     output_dir = video_dir / f"{video_name}_landmarks"
@@ -2374,24 +2061,14 @@ def process_video_new_2(video_path, adaptive_detect_func=adaptive_detect, hand_m
     else:
         end_frame = total_frames
     
-    # Set the number of worker threads if not specified
-    if num_workers is None:
-        # More conservative thread allocation to prevent system overload
-        # Use 50% of available cores (minimum 2, maximum 6) to leave resources for other processes
-        num_workers = max(2, min(multiprocessing.cpu_count() // 2, 6))
+
     
     # When in batch mode, conserve resources even more and limit output
     if batch_mode:
         # Further reduce threads in batch mode to ensure stability
-        num_workers = 8
         print(f"[{os.path.basename(str(video_path))}] Using {num_workers} worker threads")
     else:
         print(f"Video: {video_name}")
-        print(f"Total frames: {total_frames}")
-        print(f"FPS: {fps}")
-        print(f"Duration: {duration_seconds:.2f} seconds")
-        print(f"Processing frames {start_frame} to {end_frame} (time {start_time_seconds:.2f}s to {end_time_seconds if end_time_seconds is not None else duration_seconds:.2f}s)")
-        print(f"Output directory: {output_dir}")
         print(f"Using {num_workers} worker threads for parallel processing")
     
     # Function to process a single frame
@@ -2712,41 +2389,80 @@ def process_video_new_2(video_path, adaptive_detect_func=adaptive_detect, hand_m
 
 
 
-def batch_call_process_video(video_path, start_time_seconds=0, end_time_seconds=None):
+def batch_call_process_video_validated(video_path, start_time_seconds=0, end_time_seconds=None):
     """
-    Wrapper function to call process_video with optimized settings for batch processing
-    
-    This wrapper ensures that process_video runs efficiently when processing
-    multiple videos one after another.
+    Simple wrapper that validates all frames were processed and stops if not
     """
-    # Set batch_mode to True and use conservative worker count
-    return process_video_new_2(
-        video_path=video_path,
-        adaptive_detect_func=adaptive_detect,  # Use your actual adaptive_detect function
-        hand_model_path=hand_model_path,  # Use your actual path
-        face_model_path=face_model_path,  # Use your actual path
-        start_time_seconds=start_time_seconds,
-        end_time_seconds=end_time_seconds,
-        # Enable batch mode for reduced console output and resource usage
-        batch_mode=True,  
-        
-        num_workers=8
-    )
-
-
-def batch_call_process_video_with_output(video_path, start_time_seconds=0, end_time_seconds=None):
-    """Wrapper with explicit console output"""
-    import sys
-    
+ 
+   
     print(f"\nStarting processing of video: {os.path.basename(video_path)}", flush=True)
+    start_time = time.time()
     
-    # Call the original function
-    result = batch_call_process_video(video_path, start_time_seconds, end_time_seconds)
+    # Force garbage collection before processing
+    gc.collect()
     
-    print(f"Completed processing of video: {os.path.basename(video_path)}", flush=True)
-    sys.stdout.flush()
-    
-    return result
+    try:
+        # Process the video with fewer threads to reduce resource usage
+        result = process_video_new_2(
+            video_path=video_path,
+            adaptive_detect_func=adaptive_detect,
+            hand_model_path=hand_model_path,
+            face_model_path=face_model_path,
+            start_time_seconds=start_time_seconds,
+            end_time_seconds=end_time_seconds,
+            batch_mode=True,
+            num_workers=4  # Reduced thread count
+        )
+        
+        # Calculate elapsed time
+        elapsed_time = time.time() - start_time
+        
+        # Get the output directory and stats file
+        output_dir = result  # process_video returns the output directory path
+        stats_file = os.path.join(output_dir, "detection_statistics.json")
+        
+        # Check that all frames were processed
+        if os.path.exists(stats_file):
+            with open(stats_file, "r") as f:
+                stats = json.load(f)
+                
+            processed_frames = stats["video_info"]["processed_frames"]
+            total_frames = stats["video_info"]["total_frames"]
+            
+            # Verify frames match
+            if processed_frames < total_frames:
+                error_msg = f"CRITICAL ERROR: Incomplete processing detected - only {processed_frames}/{total_frames} frames were processed"
+                print(f"\n{'!'*80}\n{error_msg}\n{'!'*80}\n", flush=True)
+                
+                # Force garbage collection
+                gc.collect()
+                
+                # Raise an exception to stop the batch process
+                sys.exit(1)
+            
+            print(f"Successfully processed all {processed_frames}/{total_frames} frames in {elapsed_time:.2f} seconds", flush=True)
+        else:
+            error_msg = f"CRITICAL ERROR: Statistics file not found: {stats_file}"
+            print(f"\n{'!'*80}\n{error_msg}\n{'!'*80}\n", flush=True)
+            sys.exit(1)
+        
+        # Force garbage collection after processing
+        gc.collect()
+        
+        return result
+        
+    except Exception as e:
+        elapsed_time = time.time() - start_time
+        print(f"ERROR during processing ({elapsed_time:.2f} seconds): {str(e)}", flush=True)
+        
+        # Force garbage collection in case of error
+        gc.collect()
+        
+        # Re-raise the exception to stop batch_process_videos
+        raise
+
+
+
 
 
 
@@ -2877,7 +2593,7 @@ def batch_process_videos(video_df, process_video_func, detection_threshold_dom, 
     for idx in range(start_from_row, total_videos):
         row = video_df.iloc[idx]
         video_path = row['file_path']
-        video_fps = row['FPS']
+        video_fps = 15
         video_framecount = row['Frame Count']
         video_length = video_framecount / video_fps
         
@@ -2987,19 +2703,22 @@ def batch_process_videos(video_df, process_video_func, detection_threshold_dom, 
                 video_detail["thresholds_used"] = "normal"
                 
             # Check if detection rates are below threshold
-            if dom_hand_rate < current_detection_threshold_dom and non_dom_hand_rate < current_detection_threshold_non_dom:
-                print(f"Low detection rate for {video_name}: Dom={dom_hand_rate:.1f}%, Non-Dom={non_dom_hand_rate:.1f}%")
+            if dom_hand_rate < current_detection_threshold_dom:
+                print(f"Low dominant hand detection rate for {video_name}: Dom={dom_hand_rate:.1f}%")
+                print(f"Threshold was: {current_detection_threshold_dom}%")
                 print(f"Deleting directory: {output_dir}")
-                
+
                 # Delete the directory
                 shutil.rmtree(output_dir)
-                
+
                 # Update statistics
                 stats["processing_info"]["directories_deleted"] += 1
                 stats["deleted_directories_summary"]["count"] += 1
-                
+
                 video_detail["status"] = "deleted"
-                video_detail["reason"] = "low_detection_rate"
+                video_detail["reason"] = "low_dominant_hand_detection_rate"
+
+
             else:
                 print(f"Detection rates acceptable: Dom={dom_hand_rate:.1f}%, Non-Dom={non_dom_hand_rate:.1f}%")
                 video_detail["status"] = "kept"
@@ -3073,15 +2792,17 @@ def batch_process_videos(video_df, process_video_func, detection_threshold_dom, 
 
 
 
-
 def resample_single_video(video_info):
     """Helper function to resample a single video"""
+    gc.collect()
     video_path, desired_fps = video_info
     try:
         # Get original video properties
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            return {"path": video_path, "status": "error", "message": "Could not open video"}
+            print(f"path: {video_path}, error opening video, message: {str(e)}")
+            sys.exit(1)
+
         
         current_fps = cap.get(cv2.CAP_PROP_FPS)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -3109,6 +2830,7 @@ def resample_single_video(video_info):
             cap.set(cv2.CAP_PROP_POS_FRAMES, original_frame_idx)
             ret, frame = cap.read()
             if not ret:
+                print(f"Couldn't read frame {i} in {video_path}")
                 break
                 
             out.write(frame)
@@ -3121,8 +2843,16 @@ def resample_single_video(video_info):
         new_cap = cv2.VideoCapture(output_path)
         new_frame_count = int(new_cap.get(cv2.CAP_PROP_FRAME_COUNT))
         new_fps = new_cap.get(cv2.CAP_PROP_FPS)
+        if round(new_fps) != round(desired_fps):
+            print(f"Error lowering fps, desired {desired_fps} but got {new_fps}")
+            sys.exit(1)
+        new_total_frames = int(new_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        new_duration = new_total_frames / new_fps
+        if np.abs(new_duration-duration)>0.3:
+            print(f"Too different video duration after lowering fps, before was {duration}, now is {new_duration}")
+            sys.exit(1)
         new_cap.release()
-        
+        gc.collect()
         return {
             "path": video_path,
             "new_path": output_path,
@@ -3132,11 +2862,11 @@ def resample_single_video(video_info):
         }
         
     except Exception as e:
-        return {"path": video_path, "status": "error", "message": str(e)}
+        print(f"path: {video_path}, status: error, message: {str(e)}")
+        sys.exit(1)
 
-def resample_videos_in_dataframe(df, desired_fps, save_checkpoint=False, checkpoint_file='resampling_progress.csv', file_path_col='file_path', 
-                                delete_originals=False, inplace=False, 
-                                max_workers=None, batch_size=20):
+def resample_videos_in_dataframe(df, desired_fps, batch_size, save_checkpoint=False, checkpoint_file='resampling_progress.csv', file_path_col='file_path', 
+                                delete_originals=False):
     """
     Efficiently resamples videos in a dataframe with parallel processing and batching.
     
@@ -3145,15 +2875,13 @@ def resample_videos_in_dataframe(df, desired_fps, save_checkpoint=False, checkpo
         desired_fps (float): The desired FPS for the output videos
         file_path_col (str): Name of the column containing file paths
         delete_originals (bool): Whether to delete original videos after resampling
-        inplace (bool): Whether to modify the original dataframe or return a copy
-        max_workers (int): Max number of parallel processes (None = auto-detect)
         batch_size (int): Size of batches for processing
         
     Returns:
         pandas.DataFrame: Updated dataframe with new file paths and metadata
     """
     # Use original dataframe or create a copy
-    result_df = df if inplace else df.copy()
+    result_df = df.copy()
     
     # Check if metadata columns exist
     has_frame_count_col = 'Frame Count' in result_df.columns
@@ -3175,7 +2903,7 @@ def resample_videos_in_dataframe(df, desired_fps, save_checkpoint=False, checkpo
         print(f"Processing batch {i//batch_size + 1}/{(total_videos-1)//batch_size + 1} ({len(batch)} videos)")
         
         # Process batch in parallel
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        with ProcessPoolExecutor(max_workers=batch_size) as executor:
             futures = [executor.submit(resample_single_video, video_info) for video_info in batch]
             
             # Collect results with progress bar
@@ -3204,6 +2932,7 @@ def resample_videos_in_dataframe(df, desired_fps, save_checkpoint=False, checkpo
                                 os.remove(result["path"])
                             except Exception as e:
                                 print(f"Warning: Could not delete {result['path']}: {e}")
+                                sys.exit(1)
         if save_checkpoint:
             result_df.to_csv(checkpoint_file, index=False)
             print(f"Saved checkpoint to {checkpoint_file}")
@@ -3223,3 +2952,337 @@ def resample_videos_in_dataframe(df, desired_fps, save_checkpoint=False, checkpo
                 print(f"  - {os.path.basename(r['path'])}: {r.get('message', 'Unknown error')}")
     
     return result_df
+
+def find_landmark_directories(root_path):
+    """
+    Finds all directories with names ending in '_landmarks' under the given root path.
+    
+    Parameters:
+    root_path (str): The path to the root directory to search in
+    
+    Returns:
+    pandas.DataFrame: A DataFrame with one column 'landmarks_file_path' containing paths to landmark directories
+    """
+    landmark_paths = []
+    
+    # Walk through the directory structure
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        # Check each directory name
+        for dirname in dirnames:
+            if dirname.endswith("_landmarks"):
+                # Add the full path to our list
+                dirname = dirname + f"/"
+                full_path = os.path.join(dirpath, dirname)
+                landmark_paths.append(full_path)
+    
+    # Create a DataFrame from the list of paths
+    df = pd.DataFrame({'landmarks_file_path': landmark_paths})
+    
+    return df
+
+def remove_low_detection_directories(df, dom_threshold, non_dom_threshold, column_name='landmarks_file_path', base_dir=None):
+    """
+    Removes directories where hand detection rates fall below a threshold.
+    
+    Args:
+        df (pandas.DataFrame): DataFrame containing directory paths
+        threshold (float): Minimum acceptable detection rate (0.0 to 1.0)
+        column_name (str): Name of the column containing directory paths
+        base_dir (str, optional): Base directory to resolve relative paths. If None, paths are used as-is.
+        
+    Returns:
+        pandas.DataFrame: Updated DataFrame with rows removed for deleted directories
+        list: List of removed directory paths
+    """
+    # Create a copy of the DataFrame to avoid modifying the original during iteration
+    updated_df = df.copy()
+    total_removed = 0
+    
+    for index, row in df.iterrows():
+        rel_directory_path = row[column_name]
+        
+        # Resolve the full path if base_dir is provided
+        if base_dir:
+            directory_path = os.path.join(base_dir, rel_directory_path)
+        else:
+            directory_path = rel_directory_path
+            
+        
+        directory_path = os.path.normpath(directory_path)
+        
+        # Make sure the path exists
+        if not os.path.exists(directory_path):
+            print(f"Warning: Directory not found: {directory_path}")
+            sys.exit(1)
+            
+        # Construct path to the json file
+        json_path = os.path.join(directory_path, 'detection_statistics.json')
+        
+        if not os.path.exists(json_path):
+            print(f"Warning: JSON file not found in directory: {json_path}")
+            sys.exit(1)
+            
+        # Load the JSON file
+        try:
+            with open(json_path, 'r') as f:
+                stats = json.load(f)
+                
+            # Extract detection rates
+            dominant_rate = stats['detection_rates']['dominant_hand']['detection_rate']
+            non_dominant_rate = stats['detection_rates']['non_dominant_hand']['detection_rate']
+            total_frames = stats['video_info']['total_frames']
+            processed_frames = stats['video_info']['processed_frames']
+            
+            # Check if either rate is below threshold
+            if (dominant_rate < dom_threshold) or (non_dominant_rate < non_dom_threshold) or (total_frames != processed_frames):
+                print(f"Removing directory due to low detection rates: {directory_path}")
+                print(f"  Dominant hand: {dominant_rate}, Non-dominant hand: {non_dominant_rate}")
+                
+                # Remove the directory
+                shutil.rmtree(directory_path)
+                total_removed += 1
+                # Track removed directories
+
+                
+                # Mark this row for removal from the DataFrame
+                updated_df = updated_df.drop(index)
+                
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Error processing {json_path}: {str(e)}")
+            sys.exit(1)
+    
+    print(f"Removed {total_removed} directories")
+    
+    
+    return updated_df
+
+
+def process_landmarks_dataframe_new(dataframe, interpolate_func, batch_size=4, 
+                               report_dir=None, start_from_row=0):
+    """
+    Process multiple directories from a dataframe with checkpointing and logging.
+    
+    Args:
+        dataframe (pd.DataFrame): DataFrame with a 'landmarks_file_path' column
+        max_concurrent_dirs (int): Maximum number of directories to process in parallel
+        batch_size (int): Size of directory batches to process
+        report_dir (str): Directory to save checkpoint and report files
+                         If None, no checkpointing or reporting is done
+        start_from_row (int): Row index to start processing from (for resuming)
+        
+    Returns:
+        pd.DataFrame: The input dataframe with an additional 'interpolated_frames' column
+    """
+    # Setup logging and checkpointing
+    checkpoint_file = None
+    report_data = {
+        "start_time": datetime.now().isoformat(),
+        "end_time": None,
+        "duration_seconds": 0,
+        "total_directories": 0,
+        "processed_directories": 0,
+        "successful_interpolations": 0,
+        "failed_interpolations": 0,
+        "last_processed_row": start_from_row - 1,
+        "status": "in_progress"
+    }
+    missing_statistics_files = []
+    if report_dir:
+        os.makedirs(report_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_file = os.path.join(report_dir, f"landmarks_processing_{timestamp}.json")
+        
+        # Check if we're resuming from a crash
+        if start_from_row > 0:
+            print(f"Resuming from row {start_from_row}")
+            report_data["notes"] = f"Resumed from row {start_from_row}"
+        
+        # Initial write
+        with open(checkpoint_file, 'w') as f:
+            json.dump(report_data, f, indent=2)
+    
+    # Add directory column and reset index to ensure row tracking works correctly
+    dataframe = dataframe.reset_index(drop=True)
+
+    
+    # If resuming, apply a filter based on start_from_row
+    if start_from_row > 0:
+        working_df = dataframe.iloc[start_from_row:].copy()
+    else:
+        working_df = dataframe.copy()
+    
+    
+    unique_directories = list(working_df['landmarks_file_path'])
+    total_dirs = len(unique_directories)
+    
+    report_data["total_directories"] = total_dirs
+    print(f"Found {total_dirs} unique directories to process")
+    
+    # Limit concurrent directories based on system resources
+    max_concurrent_dirs = batch_size
+    print(f"Using {max_concurrent_dirs} concurrent processes")
+    
+    # Store results and track progress
+    overall_start_time = time.time()
+    processed_dirs = 0
+    successful_interpolations = 0
+    failed_interpolations = 0
+    last_processed_row = start_from_row - 1
+    
+    # Update checkpoint function
+    def update_checkpoint():
+        if checkpoint_file:
+            current_time = datetime.now()
+            elapsed = time.time() - overall_start_time
+            
+            report_data["processed_directories"] = processed_dirs
+            report_data["successful_interpolations"] = successful_interpolations
+            report_data["failed_interpolations"] = failed_interpolations
+            report_data["last_processed_row"] = last_processed_row
+            report_data["duration_seconds"] = elapsed
+            report_data["last_updated"] = current_time.isoformat()
+            
+            # Write to a temp file first then rename to avoid corruption if crashed during write
+            temp_file = checkpoint_file + ".tmp"
+            with open(temp_file, 'w') as f:
+                json.dump(report_data, f, indent=2)
+            
+            # Atomic rename operation
+            if os.path.exists(temp_file):
+                os.replace(temp_file, checkpoint_file)
+                
+    
+    total_interpolated=0
+    # Process directories in batches
+    try:
+        for batch_idx in range(0, len(unique_directories), batch_size):
+            batch_directories = unique_directories[batch_idx:batch_idx + batch_size]
+            print(f"\nProcessing batch {batch_idx//batch_size + 1}/{(len(unique_directories) + batch_size - 1)//batch_size} "
+                  f"({len(batch_directories)} directories)")
+            
+            mem_available = psutil.virtual_memory().available / (1024**3)  # GB
+            if mem_available < 2:  # Less than 2GB available
+                print(f"Warning: Only {mem_available:.1f}GB memory available. Waiting 1 second...")
+                time.sleep(1)  # Wait for other processes to finish
+                gc.collect()
+            
+            # Process this batch of directories in parallel
+            with ProcessPoolExecutor(max_workers=max_concurrent_dirs) as executor:
+                # Submit all directories in this batch
+                future_to_dir = {
+                    executor.submit(interpolate_func, dir_path): dir_path 
+                    for dir_path in batch_directories
+                }
+                
+                # Process results as they complete
+                for future in as_completed(future_to_dir):
+                    dir_path = future_to_dir[future]
+                    try:
+                        # Get interpolation results
+                        interpolated_frames, missing_path = future.result()
+                        if interpolated_frames==-1:
+                            missing_statistics_files.append(missing_path)
+                            print(f"Skipping directory due to missing files: {dir_path}")
+                            failed_interpolations += 1
+                            continue
+                        dir_indices = dataframe[dataframe['landmarks_file_path'] == dir_path].index
+                        dataframe.loc[dir_indices, 'interpolated_frames'] = interpolated_frames
+                        processed_dirs += 1
+                        total_interpolated += interpolated_frames
+                        
+                        # Track successful interpolations
+                        if interpolated_frames > 0:
+                            successful_interpolations += 1
+                        
+                        # Find the maximum row index for this directory
+                        dir_rows = working_df[working_df['landmarks_file_path'] == dir_path].index
+                        if len(dir_rows) > 0:
+                            last_processed_row = max(last_processed_row, max(dir_rows) + start_from_row)
+                        
+
+                        
+                    except Exception as e:
+                        print(f"Error processing directory {dir_path}: {str(e)}")
+                        failed_interpolations += 1
+                        sys.exit(1)
+            
+            # Update checkpoint after each batch
+            update_checkpoint()
+            if missing_statistics_files and report_dir:
+                missing_files_path = os.path.join(report_dir, )
+                try:
+                    with open(missing_files_path, 'w') as f:
+                        json.dump({"missing_files": missing_statistics_files}, f, indent=2)
+                except Exception as e:
+                    print(f"Error saving list of missing files: {e}")
+            
+    
+    except Exception as e:
+        print(f"Error during processing: {str(e)}")
+        if checkpoint_file:
+            report_data["status"] = "crashed"
+            report_data["error"] = str(e)
+            update_checkpoint()
+        sys.exit(1)
+    
+    # Calculate final statistics
+    total_elapsed = time.time() - overall_start_time
+
+    
+    print(f"\nProcessing completed in {total_elapsed/60:.1f} minutes")
+    print(f"Total directories processed: {processed_dirs}/{total_dirs}")
+    print(f"Total frames interpolated: {total_interpolated}")
+    print(f"Successful directories: {successful_interpolations}")
+    print(f"Failed directories: {failed_interpolations}")
+    
+
+    
+
+    
+    # Final checkpoint update
+    if checkpoint_file:
+        report_data["status"] = "completed"
+        report_data["end_time"] = datetime.now().isoformat()
+        report_data["duration_seconds"] = total_elapsed
+        report_data["processed_directories"] = processed_dirs
+        report_data["successful_interpolations"] = successful_interpolations
+        report_data["failed_interpolations"] = failed_interpolations
+        report_data["total_interpolated_frames"] = total_interpolated
+        update_checkpoint()
+    
+    return dataframe
+
+
+def find_latest_checkpoint(report_dir):
+    """
+    Find the latest checkpoint file in the report directory.
+    
+    Args:
+        report_dir (str): Directory containing checkpoint files
+        
+    Returns:
+        tuple: (latest_file_path, checkpoint_data) or (None, None) if not found
+    """
+    if not os.path.exists(report_dir):
+        return None, None
+    
+    checkpoint_files = [f for f in os.listdir(report_dir) 
+                        if f.startswith("landmarks_processing_") and f.endswith(".json")]
+    
+    if not checkpoint_files:
+        return None, None
+    
+    # Sort by modification time (most recent first)
+    latest_file = max(checkpoint_files, key=lambda f: os.path.getmtime(os.path.join(report_dir, f)))
+    latest_path = os.path.join(report_dir, latest_file)
+    
+    try:
+        with open(latest_path, 'r') as f:
+            checkpoint_data = json.load(f)
+        return checkpoint_data["last_processed_row"], checkpoint_data
+    except:
+        print("Error loading")
+        return 
+    
+
+
